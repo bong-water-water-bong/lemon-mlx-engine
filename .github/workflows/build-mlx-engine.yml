@@ -266,6 +266,16 @@ jobs:
         cp build/chat output/
         cp build/diagnose output/ 2>/dev/null || true
 
+        # Package MLX Metal shader library (required at runtime on macOS)
+        METALLIB=$(find build -name "mlx.metallib" 2>/dev/null | head -1)
+        if [ -n "$METALLIB" ]; then
+          echo "Found metalllib: $METALLIB"
+          cp "$METALLIB" output/
+        else
+          echo "WARNING: mlx.metallib not found in build tree"
+          find build -name "*.metallib" 2>/dev/null || true
+        fi
+
     - name: Upload artifacts
       uses: actions/upload-artifact@v6
       with:
