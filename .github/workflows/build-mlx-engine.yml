@@ -318,6 +318,14 @@ jobs:
     - name: Make binaries executable
       run: chmod +x mlx-binaries/server
 
+    - name: Set library path
+      run: |
+        if [ "$(uname)" = "Darwin" ]; then
+          echo "DYLD_LIBRARY_PATH=$PWD/mlx-binaries" >> $GITHUB_ENV
+        else
+          echo "LD_LIBRARY_PATH=$PWD/mlx-binaries" >> $GITHUB_ENV
+        fi
+
     - name: 'Smoke test: load model and generate'
       run: |
         set -e
