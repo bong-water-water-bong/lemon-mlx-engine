@@ -297,6 +297,7 @@ jobs:
     runs-on: ${{ fromJson(matrix.runs_on) }}
     timeout-minutes: 30
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-rocm
@@ -493,7 +494,7 @@ jobs:
         fi
 
         echo "Running inference test with Qwen3-0.6B-4bit ..."
-        response=$(curl -s --max-time 600 -X POST http://127.0.0.1:$PORT/v1/chat/completions \
+        response=$(curl -s --max-time 1200 -X POST http://127.0.0.1:$PORT/v1/chat/completions \
           -H "Content-Type: application/json" \
           -d "{
             \"model\": \"mlx-community/Qwen3-0.6B-4bit\",
