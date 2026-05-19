@@ -332,6 +332,7 @@ jobs:
         path: mlx-binaries
 
     - name: Pre-cache model
+      if: matrix.install_rocm == false
       run: |
         if [ "$(uname)" = "Darwin" ]; then
           pip3 install --break-system-packages huggingface-hub
@@ -405,7 +406,15 @@ jobs:
           exit 1
         fi
 
-        # Inference test: model should be pre-cached
+        # Inference test: skip on ROCm (no GPU on GitHub Actions runners)
+        if [ "${{ matrix.install_rocm }}" = "true" ]; then
+          echo "SKIPPING inference test on ROCm (no GPU available on CI runner)"
+          echo "SMOKE TEST PASSED -- server started, health check, and models endpoint OK (inference skipped on ROCm)"
+          kill $SERVER_PID 2>/dev/null || true
+          wait $SERVER_PID 2>/dev/null || true
+          exit 0
+        fi
+
         echo "Running inference test with Qwen3-0.6B-4bit ..."
         response=$(curl -s --max-time 600 -X POST http://127.0.0.1:$PORT/v1/chat/completions \
           -H "Content-Type: application/json" \
