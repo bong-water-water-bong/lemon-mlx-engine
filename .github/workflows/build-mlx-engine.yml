@@ -418,11 +418,14 @@ jobs:
 
     - name: Pre-cache model
       run: |
-        if [ "$(uname)" = "Darwin" ]; then
-          pip3 install --break-system-packages huggingface-hub
-        else
-          pip3 install huggingface-hub
+        # Use --break-system-packages on any environment that enforces PEP 668
+        # (macOS Homebrew Python, noble's python3.12). The marker file is the
+        # canonical signal; presence on Linux means pip will refuse otherwise.
+        PIP_FLAGS=""
+        if [ "$(uname)" = "Darwin" ] || ls /usr/lib/python3*/EXTERNALLY-MANAGED >/dev/null 2>&1; then
+          PIP_FLAGS="--break-system-packages"
         fi
+        pip3 install $PIP_FLAGS huggingface-hub
         echo "Downloading mlx-community/Qwen3-0.6B-4bit to HF cache..."
         python3 -c "
         from huggingface_hub import snapshot_download
