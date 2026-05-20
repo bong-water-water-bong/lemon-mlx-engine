@@ -32,17 +32,31 @@ BaseConfiguration parse_base_configuration(const nlohmann::json& config) {
             "quant_method", "linear_class", "quantization_mode"
         };
 
+        // VLM wrappers (Qwen3.5/3.6-MoE multimodal checkpoints) prefix every
+        // language-model weight with "language_model." in safetensors AND in
+        // the quantization config. Our per-model sanitize strips that prefix
+        // from the weights so they bind to the bare LM module tree; mirror
+        // the same strip here so the per-layer overrides line up with the
+        // sanitized weight names and the 8-bit MoE-gate overrides actually
+        // take effect (otherwise the lookup misses and the layer falls back
+        // to the default 4-bit bits, producing a shape mismatch at load).
+        static const std::string kVlmPrefix = "language_model.";
         for (auto& [key, value] : q_json.items()) {
             if (skip_keys.count(key)) continue;
 
+            std::string layer_key = key;
+            if (layer_key.compare(0, kVlmPrefix.size(), kVlmPrefix) == 0) {
+                layer_key = layer_key.substr(kVlmPrefix.size());
+            }
+
             if (value.is_boolean()) {
                 if (!value.get<bool>()) {
-                    plq.per_layer[key] = QuantizationOption::skip();
+                    plq.per_layer[layer_key] = QuantizationOption::skip();
                 }
             } else if (value.is_object()) {
                 Quantization layer_quant;
                 from_json(value, layer_quant);
-                plq.per_layer[key] = QuantizationOption::quantize(layer_quant);
+                plq.per_layer[layer_key] = QuantizationOption::quantize(layer_quant);
             }
         }
 
