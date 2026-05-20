@@ -138,6 +138,12 @@ jobs:
         export ROCM_PATH=/opt/rocm/core-7.13
         export PATH="/opt/rocm/core-7.13/bin:/opt/rocm/core-7.13/lib/llvm/bin:$PATH"
 
+        # Pin clang (ROCm 7.13 = clang 23) to GCC 13's libstdc++.
+        # GCC 15 ships an <optional> that triggers a known constraint-cycle
+        # bug under clang 23 ("satisfaction of constraint depends on itself");
+        # clang auto-selects the newest gcc install dir unless told otherwise.
+        GCC_INSTALL_DIR="/usr/lib/gcc/x86_64-linux-gnu/13"
+
         mkdir -p build && cd build
 
         cmake .. -G Ninja \
@@ -147,6 +153,9 @@ jobs:
           -DCMAKE_HIP_COMPILER=hipcc \
           -DCMAKE_PREFIX_PATH=/opt/rocm/core-7.13 \
           -DCMAKE_HIP_ARCHITECTURES="gfx1151" \
+          -DCMAKE_C_FLAGS="--gcc-install-dir=${GCC_INSTALL_DIR}" \
+          -DCMAKE_CXX_FLAGS="--gcc-install-dir=${GCC_INSTALL_DIR}" \
+          -DCMAKE_HIP_FLAGS="--gcc-install-dir=${GCC_INSTALL_DIR}" \
           -DCMAKE_CXX_CLANG_TIDY= \
           -DCLANG_TIDY_EXE=CLANG_TIDY_EXE-NOTFOUND \
           -DMINJA_EXAMPLE_ENABLED=OFF \
