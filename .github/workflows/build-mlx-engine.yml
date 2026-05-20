@@ -498,8 +498,17 @@ jobs:
         fi
 
         # Start server
+        # MLX_ROCM_QMM_DEQUANT_GEMM=0 forces the direct fused qmm/qmv kernels.
+        # The dequant+rocBLAS fallback path in mlx-rocm (NripeshN/mlx fork) produces
+        # incoherent generation on gfx1151 for 4-bit affine-quantized models — both
+        # the dequant cache and the fresh dequant+GEMM exhibit corruption while the
+        # direct kernels are correct. Bisected via env var; see issue tracker.
         echo "Starting server on port $PORT ..."
-        mlx-binaries/server --port $PORT &
+        if [ "${{ matrix.install_rocm }}" = "true" ]; then
+          MLX_ROCM_QMM_DEQUANT_GEMM=0 mlx-binaries/server --port $PORT &
+        else
+          mlx-binaries/server --port $PORT &
+        fi
         SERVER_PID=$!
         sleep 3
 
