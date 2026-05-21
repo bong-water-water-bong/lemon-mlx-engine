@@ -331,34 +331,21 @@ TEST_CASE("NaiveStreamingDetokenizer segment reset on newline", "[generate]") {
 #include <mlx-lm/common/kv_cache.h>
 #include <mlx-lm/common/attention_utils.h>
 
-static mlx_lm::Qwen35Configuration make_tiny_qwen35_args(int num_experts = 0) {
-    mlx_lm::Qwen35Configuration args;
+static mlx_lm::MTPHeadConfig make_tiny_mtp_args() {
+    mlx_lm::MTPHeadConfig args;
     args.hidden_size = 32;
-    args.num_hidden_layers = 1;
     args.intermediate_size = 64;
     args.num_attention_heads = 4;
     args.num_key_value_heads = 2;
-    args.linear_num_value_heads = 4;
-    args.linear_num_key_heads = 2;
-    args.linear_key_head_dim = 8;
-    args.linear_value_head_dim = 8;
-    args.linear_conv_kernel_dim = 4;
+    args.head_dim = 8;
+    args.rope_dims = 8;
     args.rms_norm_eps = 1e-6f;
-    args.vocab_size = 64;
-    args.num_experts = num_experts;
-    if (num_experts > 0) {
-        args.num_experts_per_tok = 2;
-        args.moe_intermediate_size = 32;
-        args.shared_expert_intermediate_size = 32;
-        args.norm_topk_prob = true;
-    }
-    args.full_attention_interval = 1;
-    args.partial_rotary_factor = 0.25f;
+    args.rope_theta = 10000.0f;
     return args;
 }
 
 TEST_CASE("MTPHead: weight map (dense)", "[mtp]") {
-    auto args = make_tiny_qwen35_args(/*num_experts=*/0);
+    auto args = make_tiny_mtp_args();
     mlx_lm::MTPHead head(args);
     auto wmap = head.weight_map();
     REQUIRE(wmap.count("pre_fc_norm_hidden.weight") == 1);
@@ -366,30 +353,13 @@ TEST_CASE("MTPHead: weight map (dense)", "[mtp]") {
     REQUIRE(wmap.count("fc.weight") == 1);
     REQUIRE(wmap.count("layers.0.input_layernorm.weight") == 1);
     REQUIRE(wmap.count("layers.0.post_attention_layernorm.weight") == 1);
+    REQUIRE(wmap.count("layers.0.self_attn.q_proj.weight") == 1);
+    REQUIRE(wmap.count("layers.0.mlp.gate_proj.weight") == 1);
     REQUIRE(wmap.count("norm.weight") == 1);
-    bool any_expert = false;
-    for (const auto& kv : wmap) {
-        if (kv.first.find("switch_mlp") != std::string::npos) any_expert = true;
-    }
-    REQUIRE_FALSE(any_expert);
-}
-
-TEST_CASE("MTPHead: weight map (MoE)", "[mtp]") {
-    auto args = make_tiny_qwen35_args(/*num_experts=*/4);
-    mlx_lm::MTPHead head(args);
-    auto wmap = head.weight_map();
-    bool has_switch = false;
-    bool has_shared = false;
-    for (const auto& kv : wmap) {
-        if (kv.first.find("switch_mlp") != std::string::npos) has_switch = true;
-        if (kv.first.find("shared_expert") != std::string::npos) has_shared = true;
-    }
-    REQUIRE(has_switch);
-    REQUIRE(has_shared);
 }
 
 TEST_CASE("MTPHead: 4 draft-token shape smoke", "[mtp]") {
-    auto args = make_tiny_qwen35_args(/*num_experts=*/0);
+    auto args = make_tiny_mtp_args();
     mlx_lm::MTPHead head(args);
 
     mlx_lm::KVCache cache{mlx_lm::KVCacheSimple{}};
@@ -399,9 +369,6 @@ TEST_CASE("MTPHead: 4 draft-token shape smoke", "[mtp]") {
     auto embedding = mx::random::normal({1, 1, args.hidden_size}, mx::float32);
 
     for (int step = 0; step < 4; ++step) {
-        // NOTE: MTPHead expects to drive a single-layer KV cache. The
-        // variant wrapper holds one KVCacheSimple slot, which is enough
-        // for this shape check.
         auto out = head(hidden, embedding, mask, &cache);
         mx::eval(out);
         REQUIRE(out.ndim() == 3);
