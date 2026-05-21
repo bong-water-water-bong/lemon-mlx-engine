@@ -9,36 +9,54 @@
 //   pre_fc_norm_hidden:    RMSNorm(H)
 //   pre_fc_norm_embedding: RMSNorm(H)
 //   fc:                    Linear(2*H -> H, no bias)
-//   layers[0]:             MTPDecoderLayer = full attention + MLP (or SparseMoE)
+//   layers[0]:             MTPDecoderLayer = full attention + MLP
 //   norm:                  RMSNorm(H)
 //
 // Used by mtp_speculative_generate_step to draft a single follow-on token
 // from (last_hidden_state, last_emitted_token) without re-running the trunk.
 //
-// This header is deliberately model-agnostic on the attention layer: callers
-// supply a callable that performs a single attention forward. In the
-// scaffolding cut we instantiate it with `Qwen35Attention` and either
-// `Qwen35MLP` or `Qwen35SparseMoeBlock`.
+// Scaffolding scope: self-contained, model-agnostic attention + MLP block
+// so we can build + smoke without dragging in Qwen35Model's full TU graph
+// (which has its own dead-code / CMake-not-listed quirks). The real wiring
+// for production will plug back into model-specific Attention / SparseMoE
+// classes once they are folded into the build properly.
 
 #pragma once
 
 #include <mlx-lm/common/kv_cache.h>
 #include <mlx-lm/common/attention_utils.h>
-#include <mlx-lm/llm/models/qwen35.h>
 #include <mlx/mlx.h>
-#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
 
 namespace mlx_lm {
 
+// Minimal configuration block for MTPHead. Mirrors the subset of
+// Qwen35Configuration that MTP actually needs. We keep this self-contained
+// so MTPHead can be constructed in tests without pulling in Qwen35Model.
+struct MTPHeadConfig {
+    int hidden_size = 0;
+    int intermediate_size = 0;
+    int num_attention_heads = 0;
+    int num_key_value_heads = 0;
+    int head_dim = 0;       // 0 = hidden_size / num_attention_heads
+    float rms_norm_eps = 1e-6f;
+    float rope_theta = 100000.0f;
+    int rope_dims = 0;      // 0 = head_dim (full rotary)
+
+    int resolved_head_dim() const {
+        return head_dim != 0 ? head_dim : hidden_size / num_attention_heads;
+    }
+};
+
 // Single full-attention decoder layer for the MTP head. Mirrors
-// `MTPDecoderLayer.__call__` from qwen3_5.py:325. No GatedDeltaNet variant --
-// MTP always uses standard attention, per the upstream MTP reference.
+// `MTPDecoderLayer.__call__` from qwen3_5.py:325. Self-attention + MLP +
+// pre/post RMSNorm; no GatedDeltaNet variant -- MTP always uses standard
+// attention per the upstream MTP reference.
 class MTPDecoderLayer {
 public:
-    MTPDecoderLayer(const Qwen35Configuration& args, bool use_moe);
+    explicit MTPDecoderLayer(const MTPHeadConfig& args);
 
     mlx::core::array operator()(
         const mlx::core::array& x,
@@ -48,25 +66,35 @@ public:
     std::unordered_map<std::string, mlx::core::array*> weight_map();
 
 private:
-    bool use_moe_;
-    Qwen35Attention self_attn_;
+    MTPHeadConfig args_;
+
+    // Attention weights.
+    mlx::core::array q_proj_weight_;
+    mlx::core::array k_proj_weight_;
+    mlx::core::array v_proj_weight_;
+    mlx::core::array o_proj_weight_;
+    mlx::core::array q_norm_weight_;
+    mlx::core::array k_norm_weight_;
+
+    // Layer norms.
     mlx::core::array input_layernorm_weight_;
     mlx::core::array post_attention_layernorm_weight_;
-    float rms_norm_eps_;
-    // Exactly one of these is engaged depending on use_moe_.
-    std::optional<Qwen35MLP> dense_mlp_;
-    std::optional<Qwen35SparseMoeBlock> moe_mlp_;
+
+    // MLP weights (SwiGLU).
+    mlx::core::array gate_proj_weight_;
+    mlx::core::array up_proj_weight_;
+    mlx::core::array down_proj_weight_;
 };
 
 class MTPHead {
 public:
-    explicit MTPHead(const Qwen35Configuration& args);
+    explicit MTPHead(const MTPHeadConfig& args);
 
     // Run one MTP draft step.
     //   hidden_state:    [B, T, H]  -- pre-norm hidden from the trunk
     //   token_embedding: [B, T, H]  -- embed(last_emitted_token)
-    //   mask: causal mask (typically T=1, mask is std::nullopt-equivalent)
-    //   cache: pointer to a single-layer KV cache vector owned by the caller.
+    //   mask: attention mask (typically `AttentionMask::none()` for T=1)
+    //   cache: single-layer KV cache owned by the caller.
     // Returns the pre-norm hidden state of the MTP layer (same shape as input).
     mlx::core::array operator()(
         const mlx::core::array& hidden_state,
@@ -81,17 +109,17 @@ public:
     std::unordered_map<std::string, mlx::core::array*> weight_map();
 
     // Load mtp.* weights as harvested by the model loader (I7 sub-task 1).
-    // The keys are expected to have a "mtp." prefix; this strips it.
+    // Strips any prefix up to and including "mtp.".
     void load_mtp_weights(
         const std::unordered_map<std::string, mlx::core::array>& mtp_weights);
 
 private:
+    MTPHeadConfig args_;
     mlx::core::array pre_fc_norm_hidden_weight_;
     mlx::core::array pre_fc_norm_embedding_weight_;
     mlx::core::array fc_weight_;  // [H, 2*H]
     MTPDecoderLayer layer_;
     mlx::core::array norm_weight_;
-    float rms_norm_eps_;
 };
 
-} // namespace mlx_lm
+}  // namespace mlx_lm
