@@ -362,19 +362,11 @@ jobs:
         ROCM_VER="${{ env.ROCM_VERSION }}"
         ROCM_ARCH="${{ env.ROCM_ARCH }}"
 
-        echo "=== ROCm Runtime Setup ==="
-
         # Verify-then-install: check if ROCm ${{ env.ROCM_VERSION }} for ${{ env.ROCM_ARCH }} is already installed
         ROCM_INSTALLED="false"
         if dpkg -s "amdrocm${ROCM_VER}-${ROCM_ARCH}" 2>/dev/null | grep -q "Status: install ok installed"; then
           echo "ROCm ${ROCM_VER} ${ROCM_ARCH} package already installed"
           ROCM_INSTALLED="true"
-        fi
-
-        if [ -e /dev/kfd ]; then
-          echo "/dev/kfd: FOUND"
-        else
-          echo "/dev/kfd: NOT FOUND (will check again after ROCm install)"
         fi
 
         if [ "${ROCM_INSTALLED}" = "false" ]; then
@@ -403,22 +395,6 @@ jobs:
 
           echo "ROCm ${ROCM_VER} runtime installation complete"
         fi
-
-        # Post-install GPU verification
-        echo "=== Post-Install GPU Verification ==="
-        if [ -e /dev/kfd ]; then
-          echo "/dev/kfd: FOUND"
-        else
-          echo "::warning::/dev/kfd missing after ROCm install. GPU hardware may not be present or kernel modules not loaded."
-        fi
-
-        if command -v "/opt/rocm/core-${ROCM_VER}/bin/rocm-smi" &>/dev/null; then
-          echo "rocm-smi output:"
-          "/opt/rocm/core-${ROCM_VER}/bin/rocm-smi" 2>&1 || echo "  rocm-smi returned non-zero"
-        else
-          echo "rocm-smi: not found at /opt/rocm/core-${ROCM_VER}/bin/rocm-smi"
-        fi
-
 
     - name: Download build artifact
       uses: actions/download-artifact@v6
