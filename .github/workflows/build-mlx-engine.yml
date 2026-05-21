@@ -20,6 +20,8 @@ on:
 
 env:
   OPERATING_SYSTEMS: ${{ github.event.inputs.operating_systems || 'ubuntu,macos' }}
+  ROCM_VERSION: '7.13'
+  ROCM_ARCH: 'gfx1151'
 
 jobs:
   prepare-matrix:
@@ -82,16 +84,19 @@ jobs:
           echo "All build deps already installed; skipping apt-get update."
         fi
 
-    - name: Install ROCm 7.13.0 (gfx1151)
+    - name: Install ROCm ${{ env.ROCM_VERSION }} (${{ env.ROCM_ARCH }})
       run: |
-        # Verify-then-install: check if ROCm 7.13 for gfx1151 is already on the runner
-        if dpkg -s amdrocm7.13-gfx1151 2>/dev/null | grep -q "Status: install ok installed" \
-           && dpkg -s amdrocm-core-dev7.13-gfx1151 2>/dev/null | grep -q "Status: install ok installed"; then
-          echo "ROCm 7.13 gfx1151 packages already installed; skipping."
+        ROCM_VER="${{ env.ROCM_VERSION }}"
+        ROCM_ARCH="${{ env.ROCM_ARCH }}"
+
+        # Verify-then-install: check if ROCm ${{ env.ROCM_VERSION }} for ${{ env.ROCM_ARCH }} is already on the runner
+        if dpkg -s "amdrocm${ROCM_VER}-${ROCM_ARCH}" 2>/dev/null | grep -q "Status: install ok installed" \
+           && dpkg -s "amdrocm-core-dev${ROCM_VER}-${ROCM_ARCH}" 2>/dev/null | grep -q "Status: install ok installed"; then
+          echo "ROCm ${ROCM_VER} ${ROCM_ARCH} packages already installed; skipping."
           exit 0
         fi
 
-        # AMD official ROCm 7.13.0 noble (ubuntu 24.04) repo, per-arch packaging
+        # AMD official ROCm ${{ env.ROCM_VERSION }} noble (ubuntu 24.04) repo, per-arch packaging
         sudo mkdir --parents --mode=0755 /etc/apt/keyrings
         if [ ! -f /etc/apt/keyrings/amdrocm.gpg ]; then
           wget -q https://repo.amd.com/rocm/packages/gpg/rocm.gpg -O - | \
@@ -103,23 +108,24 @@ jobs:
 
         sudo apt-get update
         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-overwrite" \
-          amdrocm7.13-gfx1151 \
-          amdrocm-core-dev7.13-gfx1151 \
-          amdrocm-base7.13 \
-          amdrocm-blas-dev7.13-gfx1151 \
-          amdrocm-sparse-dev7.13-gfx1151 \
-          amdrocm-solver-dev7.13-gfx1151 \
-          amdrocm-fft-dev7.13-gfx1151 \
-          amdrocm-rand-dev7.13-gfx1151
+          "amdrocm${ROCM_VER}-${ROCM_ARCH}" \
+          "amdrocm-core-dev${ROCM_VER}-${ROCM_ARCH}" \
+          "amdrocm-base${ROCM_VER}" \
+          "amdrocm-blas-dev${ROCM_VER}-${ROCM_ARCH}" \
+          "amdrocm-sparse-dev${ROCM_VER}-${ROCM_ARCH}" \
+          "amdrocm-solver-dev${ROCM_VER}-${ROCM_ARCH}" \
+          "amdrocm-fft-dev${ROCM_VER}-${ROCM_ARCH}" \
+          "amdrocm-rand-dev${ROCM_VER}-${ROCM_ARCH}"
 
-        echo "Installed ROCm 7.13.0 for gfx1151 from AMD apt."
+        echo "Installed ROCm ${ROCM_VER} for ${ROCM_ARCH} from AMD apt."
 
     - name: Set ROCm environment variables
       run: |
-        echo "HIP_PATH=/opt/rocm/core-7.13" >> $GITHUB_ENV
-        echo "ROCM_PATH=/opt/rocm/core-7.13" >> $GITHUB_ENV
+        ROCM_VER="${{ env.ROCM_VERSION }}"
+        echo "HIP_PATH=/opt/rocm/core-${ROCM_VER}" >> $GITHUB_ENV
+        echo "ROCM_PATH=/opt/rocm/core-${ROCM_VER}" >> $GITHUB_ENV
         echo "HIP_PLATFORM=amd" >> $GITHUB_ENV
-        echo "/opt/rocm/core-7.13/bin:/opt/rocm/core-7.13/lib/llvm/bin:$PATH" >> $GITHUB_PATH
+        echo "/opt/rocm/core-${ROCM_VER}/bin:/opt/rocm/core-${ROCM_VER}/lib/llvm/bin:$PATH" >> $GITHUB_PATH
 
     - name: Cache FetchContent MLX source
       uses: actions/cache@v4
@@ -134,11 +140,13 @@ jobs:
 
     - name: Build MLX Engine + ROCm
       run: |
-        export HIP_PATH=/opt/rocm/core-7.13
-        export ROCM_PATH=/opt/rocm/core-7.13
-        export PATH="/opt/rocm/core-7.13/bin:/opt/rocm/core-7.13/lib/llvm/bin:$PATH"
+        ROCM_VER="${{ env.ROCM_VERSION }}"
+        ROCM_ARCH="${{ env.ROCM_ARCH }}"
+        export HIP_PATH=/opt/rocm/core-${ROCM_VER}
+        export ROCM_PATH=/opt/rocm/core-${ROCM_VER}
+        export PATH="/opt/rocm/core-${ROCM_VER}/bin:/opt/rocm/core-${ROCM_VER}/lib/llvm/bin:$PATH"
 
-        # Pin clang (ROCm 7.13 = clang 23) to GCC 13's libstdc++.
+        # Pin clang (ROCm ${{ env.ROCM_VERSION }} = clang 23) to GCC 13's libstdc++.
         # GCC 15 ships an <optional> that triggers a known constraint-cycle
         # bug under clang 23 ("satisfaction of constraint depends on itself");
         # clang auto-selects the newest gcc install dir unless told otherwise.
@@ -151,8 +159,8 @@ jobs:
           -DCMAKE_C_COMPILER=clang \
           -DCMAKE_CXX_COMPILER=clang++ \
           -DCMAKE_HIP_COMPILER=hipcc \
-          -DCMAKE_PREFIX_PATH=/opt/rocm/core-7.13 \
-          -DCMAKE_HIP_ARCHITECTURES="gfx1151" \
+          -DCMAKE_PREFIX_PATH=/opt/rocm/core-${ROCM_VER} \
+          -DCMAKE_HIP_ARCHITECTURES="${ROCM_ARCH}" \
           -DCMAKE_C_FLAGS="--gcc-install-dir=${GCC_INSTALL_DIR}" \
           -DCMAKE_CXX_FLAGS="--gcc-install-dir=${GCC_INSTALL_DIR}" \
           -DCMAKE_HIP_FLAGS="--gcc-install-dir=${GCC_INSTALL_DIR}" \
@@ -351,12 +359,15 @@ jobs:
     - name: ROCm runtime setup (Ubuntu ROCm only)
       if: matrix.install_rocm
       run: |
+        ROCM_VER="${{ env.ROCM_VERSION }}"
+        ROCM_ARCH="${{ env.ROCM_ARCH }}"
+
         echo "=== ROCm Runtime Setup ==="
 
-        # Verify-then-install: check if ROCm 7.13 for gfx1151 is already installed
+        # Verify-then-install: check if ROCm ${{ env.ROCM_VERSION }} for ${{ env.ROCM_ARCH }} is already installed
         ROCM_INSTALLED="false"
-        if dpkg -s amdrocm7.13-gfx1151 2>/dev/null | grep -q "Status: install ok installed"; then
-          echo "ROCm 7.13 gfx1151 package already installed"
+        if dpkg -s "amdrocm${ROCM_VER}-${ROCM_ARCH}" 2>/dev/null | grep -q "Status: install ok installed"; then
+          echo "ROCm ${ROCM_VER} ${ROCM_ARCH} package already installed"
           ROCM_INSTALLED="true"
         fi
 
@@ -367,7 +378,7 @@ jobs:
         fi
 
         if [ "${ROCM_INSTALLED}" = "false" ]; then
-          echo "Installing ROCm 7.13.0 runtime (gfx1151) from AMD noble apt repository..."
+          echo "Installing ROCm ${{ env.ROCM_VERSION }} runtime (${ROCM_ARCH}) from AMD noble apt repository..."
 
           sudo mkdir --parents --mode=0755 /etc/apt/keyrings
           if [ ! -f /etc/apt/keyrings/amdrocm.gpg ]; then
@@ -380,10 +391,10 @@ jobs:
 
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::="--force-overwrite" \
-            amdrocm7.13-gfx1151 \
-            amdrocm-base7.13
+            "amdrocm${ROCM_VER}-${ROCM_ARCH}" \
+            "amdrocm-base${ROCM_VER}"
 
-          echo "/opt/rocm/core-7.13/lib" | sudo tee /etc/ld.so.conf.d/rocm.conf
+          echo "/opt/rocm/core-${ROCM_VER}/lib" | sudo tee /etc/ld.so.conf.d/rocm.conf
           sudo ldconfig
 
           # Attempt to load kernel modules for GPU detection
@@ -391,7 +402,7 @@ jobs:
           sudo modprobe amdkfd 2>/dev/null || true
           sleep 2
 
-          echo "ROCm 7.13.0 runtime installation complete"
+          echo "ROCm ${ROCM_VER} runtime installation complete"
         fi
 
         # Post-install GPU verification
@@ -402,11 +413,11 @@ jobs:
           echo "::warning::/dev/kfd missing after ROCm install. GPU hardware may not be present or kernel modules not loaded."
         fi
 
-        if command -v /opt/rocm/core-7.13/bin/rocm-smi &>/dev/null; then
+        if command -v "/opt/rocm/core-${ROCM_VER}/bin/rocm-smi" &>/dev/null; then
           echo "rocm-smi output:"
-          /opt/rocm/core-7.13/bin/rocm-smi 2>&1 || echo "  rocm-smi returned non-zero"
+          "/opt/rocm/core-${ROCM_VER}/bin/rocm-smi" 2>&1 || echo "  rocm-smi returned non-zero"
         else
-          echo "rocm-smi: not found at /opt/rocm/core-7.13/bin/rocm-smi"
+          echo "rocm-smi: not found at /opt/rocm/core-${ROCM_VER}/bin/rocm-smi"
         fi
 
 
@@ -443,8 +454,8 @@ jobs:
       run: |
         if [ "$(uname)" = "Darwin" ]; then
           echo "DYLD_LIBRARY_PATH=$PWD/mlx-binaries" >> $GITHUB_ENV
-        elif [ -d /opt/rocm/core-7.13/lib ]; then
-          echo "LD_LIBRARY_PATH=$PWD/mlx-binaries:/opt/rocm/core-7.13/lib" >> $GITHUB_ENV
+        elif [ -d "/opt/rocm/core-${{ env.ROCM_VERSION }}/lib" ]; then
+          echo "LD_LIBRARY_PATH=$PWD/mlx-binaries:/opt/rocm/core-${{ env.ROCM_VERSION }}/lib" >> $GITHUB_ENV
         elif [ -d /opt/rocm/lib ]; then
           echo "LD_LIBRARY_PATH=$PWD/mlx-binaries:/opt/rocm/lib" >> $GITHUB_ENV
         else
@@ -690,11 +701,11 @@ jobs:
           --notes "**Build Number**: $TAG
         **Build Date**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
 
-        MLX Engine binaries with ROCm 7.13.0, CPU, and macOS support.
-        **Requires system ROCm 7.13.0 installation** — ROCm libraries are not bundled.
+        MLX Engine binaries with ROCm ${{ env.ROCM_VERSION }}, CPU, and macOS support.
+        **Requires system ROCm ${{ env.ROCM_VERSION }} installation** — ROCm libraries are not bundled.
 
         ### Downloads
-        - **Ubuntu ROCm 7.13.0**: mlx-engine-${TAG}-ubuntu-rocm-x64.zip
+        - **Ubuntu ROCm ${{ env.ROCM_VERSION }}**: mlx-engine-${TAG}-ubuntu-rocm-x64.zip
         - **Ubuntu CPU**: mlx-engine-${TAG}-ubuntu-cpu-x64.zip
         - **macOS ARM64**: mlx-engine-${TAG}-macos-arm64.zip" \
           $upload_files
