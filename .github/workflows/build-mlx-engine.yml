@@ -69,21 +69,6 @@ jobs:
       uses: actions/checkout@v6
       with:
         submodules: recursive
-
-    - name: Install build dependencies
-      run: |
-        # Verify-then-install: skip apt-get update if all packages are present
-        NEED_INSTALL=""
-        for pkg in cmake ninja-build libcurl4-openssl-dev libopenblas-dev liblapacke-dev pkg-config; do
-          dpkg -s "$pkg" 2>/dev/null | grep -q "Status: install ok installed" || NEED_INSTALL="$NEED_INSTALL $pkg"
-        done
-        if [ -n "$NEED_INSTALL" ]; then
-          sudo apt-get update
-          sudo apt-get install -y $NEED_INSTALL
-        else
-          echo "All build deps already installed; skipping apt-get update."
-        fi
-
     - name: Install ROCm ${{ env.ROCM_VERSION }} (${{ env.ROCM_ARCH }})
       run: |
         ROCM_VER="${{ env.ROCM_VERSION }}"
@@ -96,28 +81,7 @@ jobs:
           exit 0
         fi
 
-        # AMD official ROCm ${{ env.ROCM_VERSION }} noble (ubuntu 24.04) repo, per-arch packaging
-        sudo mkdir --parents --mode=0755 /etc/apt/keyrings
-        if [ ! -f /etc/apt/keyrings/amdrocm.gpg ]; then
-          wget -q https://repo.amd.com/rocm/packages/gpg/rocm.gpg -O - | \
-            gpg --dearmor | sudo tee /etc/apt/keyrings/amdrocm.gpg > /dev/null
-        fi
-
-        echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://repo.amd.com/rocm/packages/ubuntu2404 stable main" \
-          | sudo tee /etc/apt/sources.list.d/rocm.list
-
-        sudo apt-get update
-        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-          "amdrocm${ROCM_VER}-${ROCM_ARCH}" \
-          "amdrocm-core-dev${ROCM_VER}-${ROCM_ARCH}" \
-          "amdrocm-base${ROCM_VER}" \
-          "amdrocm-blas-dev${ROCM_VER}-${ROCM_ARCH}" \
-          "amdrocm-sparse-dev${ROCM_VER}-${ROCM_ARCH}" \
-          "amdrocm-solver-dev${ROCM_VER}-${ROCM_ARCH}" \
-          "amdrocm-fft-dev${ROCM_VER}-${ROCM_ARCH}" \
-          "amdrocm-rand-dev${ROCM_VER}-${ROCM_ARCH}"
-
-        echo "Installed ROCm ${ROCM_VER} for ${ROCM_ARCH} from AMD apt."
+        exit 1
 
     - name: Set ROCm environment variables
       run: |
@@ -373,30 +337,7 @@ jobs:
         fi
 
         if [ "${ROCM_INSTALLED}" = "false" ]; then
-          echo "Installing ROCm ${{ env.ROCM_VERSION }} runtime (${ROCM_ARCH}) from AMD noble apt repository..."
-
-          sudo mkdir --parents --mode=0755 /etc/apt/keyrings
-          if [ ! -f /etc/apt/keyrings/amdrocm.gpg ]; then
-            wget -q https://repo.amd.com/rocm/packages/gpg/rocm.gpg -O - | \
-              gpg --dearmor | sudo tee /etc/apt/keyrings/amdrocm.gpg > /dev/null
-          fi
-
-          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://repo.amd.com/rocm/packages/ubuntu2404 stable main" \
-            | sudo tee /etc/apt/sources.list.d/rocm.list
-
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            "amdrocm${ROCM_VER}-${ROCM_ARCH}" \
-            "amdrocm-base${ROCM_VER}"
-
-          echo "/opt/rocm/core-${ROCM_VER}/lib" | sudo tee /etc/ld.so.conf.d/rocm.conf
-          sudo ldconfig
-
-          # Attempt to load kernel module for GPU detection
-          sudo modprobe amdgpu 2>/dev/null || true
-          sleep 2
-
-          echo "ROCm ${ROCM_VER} runtime installation complete"
+          return 1;
         fi
 
     - name: Download build artifact
