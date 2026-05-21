@@ -347,14 +347,17 @@ jobs:
             artifact: mlx-engine-ubuntu-rocm-x64
             runs_on: '["self-hosted", "Linux", "X64", "gfx1151"]'
             install_rocm: true
+            model: mlx-community/Qwen3-1.7B-4bit
           - os: ubuntu-cpu
             artifact: mlx-engine-ubuntu-cpu-x64
             runs_on: '"ubuntu-22.04"'
             install_rocm: false
+            model: mlx-community/Qwen3-0.6B-4bit
           - os: macos-arm64
             artifact: mlx-engine-macos-arm64
             runs_on: '"macos-latest"'
             install_rocm: false
+            model: mlx-community/Qwen3-1.7B-4bit
     steps:
     - name: ROCm runtime setup (Ubuntu ROCm only)
       if: matrix.install_rocm
@@ -410,7 +413,7 @@ jobs:
         python3 -c "
         from huggingface_hub import snapshot_download
         snapshot_download(
-            repo_id='mlx-community/Qwen3-1.7B-4bit',
+            repo_id='${{ matrix.model }}',
             allow_patterns=['*.json', '*.safetensors'],
         )
         print('Model cached successfully')
@@ -484,11 +487,11 @@ jobs:
           exit 1
         fi
 
-        echo "Running inference test with Qwen3-1.7B-4bit ..."
+        echo "Running inference test with ${{ matrix.model }} ..."
         response=$(curl -s --max-time 1200 -X POST http://127.0.0.1:$PORT/v1/chat/completions \
           -H "Content-Type: application/json" \
           -d "{
-            \"model\": \"mlx-community/Qwen3-1.7B-4bit\",
+            \"model\": \"${{ matrix.model }}\",
             \"messages\": [{\"role\": \"user\", \"content\": \"What is 2+2? Answer with just the number.\"}],
             \"max_tokens\": 128,
             \"temperature\": 0.0,
