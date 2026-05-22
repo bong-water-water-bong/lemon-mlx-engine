@@ -489,17 +489,68 @@ jobs:
       with:
         path: ./all-artifacts
 
+    - name: Decide whether to cut a release
+      id: should-release
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        EVENT_NAME: ${{ github.event_name }}
+        HEAD_SHA: ${{ github.sha }}
+        REPO: ${{ github.repository }}
+      run: |
+        # workflow_dispatch is an intentional ask — always release (the job-
+        # level `if:` already gates on create_release input). Scheduled runs
+        # only cut a release if main has moved since the last release tag, so
+        # the nightly cron is a no-op on quiet days but builds still run for
+        # green-CI signal.
+        if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+          echo "workflow_dispatch: forcing release."
+          echo "should_release=true" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        latest_tag=$(gh release list --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || echo "")
+        if [ -z "$latest_tag" ]; then
+          echo "No prior release found; cutting the first one."
+          echo "should_release=true" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # Resolve the tag's commit. Lightweight tags point straight at a
+        # commit; annotated tags point at a tag object that needs one more
+        # deref. `gh release create` makes lightweight tags so the first
+        # branch will normally hit, but handle both for safety.
+        ref=$(gh api "repos/${REPO}/git/refs/tags/${latest_tag}" 2>/dev/null || echo "")
+        obj_type=$(echo "$ref" | jq -r '.object.type // empty')
+        obj_sha=$(echo "$ref" | jq -r '.object.sha // empty')
+        if [ "$obj_type" = "tag" ] && [ -n "$obj_sha" ]; then
+          obj_sha=$(gh api "repos/${REPO}/git/tags/${obj_sha}" --jq '.object.sha' 2>/dev/null || echo "$obj_sha")
+        fi
+
+        echo "Latest release: ${latest_tag} → ${obj_sha:-unknown}"
+        echo "Current HEAD:   ${HEAD_SHA}"
+        if [ -n "$obj_sha" ] && [ "$obj_sha" = "$HEAD_SHA" ]; then
+          echo "main is unchanged since ${latest_tag}; skipping release."
+          echo "should_release=false" >> $GITHUB_OUTPUT
+        else
+          echo "main has new commits since ${latest_tag}; cutting a release."
+          echo "should_release=true" >> $GITHUB_OUTPUT
+        fi
+
     - name: Generate release tag
       id: generate-tag
+      if: steps.should-release.outputs.should_release == 'true'
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
+        # Tag format: b<NNNN>-stable. The regex tolerates the older bare
+        # b<NNNN> tags so we keep counting from the existing sequence; the
+        # sed strips any suffix before sorting numerically.
         existing_tags=$(gh release list --limit 1000 --json tagName --jq '.[].tagName' \
           | grep -E "^b[0-9]{4}(-[a-z]+)?$" | sed 's/-.*$//' | sort -uV || echo "")
 
         if [ -z "$existing_tags" ]; then
           next_number=1000
-          echo "No existing sequential release tags found, starting with b1000"
+          echo "No existing sequential release tags found, starting with b1000-stable"
         else
           highest_tag=$(echo "$existing_tags" | tail -n 1)
           highest_number=$(echo "$highest_tag" | sed 's/^b//')
@@ -507,12 +558,13 @@ jobs:
           echo "Highest existing tag: $highest_tag (number: $highest_number)"
         fi
 
-        TAG=$(printf "b%04d" $next_number)
+        TAG=$(printf "b%04d-stable" $next_number)
         echo "tag=${TAG}" >> $GITHUB_OUTPUT
         echo "Generated release tag: ${TAG}"
 
     - name: Check if tag already exists
       id: check-tag
+      if: steps.should-release.outputs.should_release == 'true'
       run: |
         TAG="${{ steps.generate-tag.outputs.tag }}"
         if git ls-remote --tags origin "$TAG" | grep -q "$TAG"; then
@@ -523,7 +575,7 @@ jobs:
         fi
 
     - name: Create archives
-      if: steps.check-tag.outputs.tag_exists == 'false'
+      if: steps.should-release.outputs.should_release == 'true' && steps.check-tag.outputs.tag_exists == 'false'
       run: |
         TAG="${{ steps.generate-tag.outputs.tag }}"
 
@@ -552,7 +604,7 @@ jobs:
         ls -la *.zip 2>/dev/null || echo "No archives created"
 
     - name: Create Release
-      if: steps.check-tag.outputs.tag_exists == 'false'
+      if: steps.should-release.outputs.should_release == 'true' && steps.check-tag.outputs.tag_exists == 'false'
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
