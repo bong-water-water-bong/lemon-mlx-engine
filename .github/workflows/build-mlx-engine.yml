@@ -247,6 +247,7 @@ jobs:
           -DCMAKE_CXX_CLANG_TIDY= \
           -DCLANG_TIDY_EXE=CLANG_TIDY_EXE-NOTFOUND \
           -DMINJA_EXAMPLE_ENABLED=OFF \
+          -DMLX_BUILD_ROCM=OFF \
           -DMLX_LM_BUILD_TESTS=ON \
           -DMLX_LM_BUILD_EXAMPLES=ON
 
@@ -447,7 +448,7 @@ jobs:
                 {\"role\": \"system\", \"content\": \"You are a math assistant. Answer arithmetic questions with a single number.\"},
                 {\"role\": \"user\", \"content\": \"What is 2+2? Answer with just the number.\"}
               ],
-              \"max_tokens\": 4,
+              \"max_tokens\": 128,
               \"temperature\": 0.0,
               \"stream\": false
             }" 2>&1) || {
@@ -456,11 +457,21 @@ jobs:
           }
 
           content=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'].strip())" 2>/dev/null) || content=""
-          # Strip Qwen3 thinking/reasoning tags before checking the answer
-          content=$(echo "$content" | sed 's/<think>.*<\/think>//g' | tr -d '\n' | xargs)
+          # Strip thinking tags and extract the first number to verify answer is 4
+          content_stripped=$(echo "$content" | sed 's/<think>.*<\/think>//g' | tr -d '\n')
+          answer=$(echo "$content_stripped" | python3 -c "
+import sys, re
+text = sys.stdin.read().strip()
+nums = re.findall(r'\b(\d+)\b', text)
+if nums:
+    print(nums[0])
+else:
+    print('')
+" 2>/dev/null) || answer=""
           echo "Attempt $ATTEMPT response: $content"
+          echo "Attempt $ATTEMPT extracted answer: $answer"
 
-          if echo "$content" | grep -q "4"; then
+          if [ "$answer" = "4" ]; then
             PASS=true
             break
           fi
@@ -474,7 +485,7 @@ jobs:
           echo "=== Server Response ==="
           echo "$response" | python3 -m json.tool 2>/dev/null || echo "$response"
           echo "=== End Response ==="
-          echo "INFERENCE TEST FAILED -- expected '4' in response after $MAX_RETRIES attempts"
+          echo "INFERENCE TEST FAILED -- expected answer '4' after $MAX_RETRIES attempts"
           echo "=== Server Log (last 50 lines) ==="
           tail -50 server.log 2>/dev/null || true
           kill $SERVER_PID 2>/dev/null || true
