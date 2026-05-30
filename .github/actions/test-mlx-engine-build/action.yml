@@ -78,7 +78,7 @@ runs:
         response=$(curl -s --max-time 300 -X POST http://127.0.0.1:19102/v1/chat/completions \
           -H "Content-Type: application/json" \
           -d '{
-            "model": "mlx-community/Qwen3-1.7B-4bit",
+            "model": "mlx-community/Qwen3.5-0.8B-4bit",
             "messages": [{"role": "user", "content": "What is 2+2? Reply with just the number."}],
             "max_tokens": 32,
             "temperature": 0.0,

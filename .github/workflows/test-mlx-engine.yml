@@ -138,12 +138,12 @@ jobs:
     - name: Download test model
       run: |
         # Download a small MLX model for testing
-        # Using mlx-community/Qwen3-1.7B-4bit (935MB, fast to load)
-        model_id="mlx-community/Qwen3-1.7B-4bit"
+        # Using mlx-community/Qwen3.5-0.8B-4bit (935MB, fast to load)
+        model_id="mlx-community/Qwen3.5-0.8B-4bit"
         cache_dir="$HOME/.cache/huggingface/hub"
 
         # Check if already cached
-        model_dir="${cache_dir}/models--mlx-community--Qwen3-1.7B-4bit"
+        model_dir="${cache_dir}/models--mlx-community--Qwen3.5-0.8B-4bit"
         if [ -d "$model_dir" ]; then
           echo "Model already cached"
         else
@@ -218,7 +218,7 @@ jobs:
         response=$(curl -s --max-time 300 -X POST http://127.0.0.1:18997/v1/chat/completions \
           -H "Content-Type: application/json" \
           -d '{
-            "model": "mlx-community/Qwen3-1.7B-4bit",
+            "model": "mlx-community/Qwen3.5-0.8B-4bit",
             "messages": [{"role": "user", "content": "What is 2+2? Reply with just the number."}],
             "max_tokens": 32,
             "temperature": 0.0,
@@ -269,7 +269,7 @@ jobs:
         response=$(curl -s --max-time 300 -X POST http://127.0.0.1:18996/v1/chat/completions \
           -H "Content-Type: application/json" \
           -d '{
-            "model": "mlx-community/Qwen3-1.7B-4bit",
+            "model": "mlx-community/Qwen3.5-0.8B-4bit",
             "messages": [{"role": "user", "content": "What is 2+2? Reply with just the number."}],
             "max_tokens": 32,
             "temperature": 0.0,

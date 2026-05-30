@@ -48,7 +48,7 @@ Models are specified as HuggingFace repo IDs (auto-downloaded on first use) or l
 
 ```bash
 # Basic usage -- downloads the model on first run
-./chat mlx-community/Qwen3-1.7B-4bit
+./chat mlx-community/Qwen3.5-0.8B-4bit
 
 # With system prompt and tuned sampling
 ./chat mlx-community/Qwen3-4B-4bit \

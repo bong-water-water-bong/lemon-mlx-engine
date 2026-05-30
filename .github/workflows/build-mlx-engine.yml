@@ -457,14 +457,15 @@ jobs:
           }
 
           content=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'].strip())" 2>/dev/null) || content=""
-          # Strip thinking tags and extract the first number to verify answer is 4
-          content_stripped=$(echo "$content" | sed 's/<think>.*<\/think>//g' | tr -d '\n')
-          answer=$(echo "$content_stripped" | python3 -c "
+          answer=$(echo "$content" | python3 -c "
 import sys, re
-text = sys.stdin.read().strip()
+text = sys.stdin.read()
+# Strip multi-line <think>...</think> blocks
+text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+# Extract the last number from the remaining text (answer appears at end)
 nums = re.findall(r'\b(\d+)\b', text)
 if nums:
-    print(nums[0])
+    print(nums[-1])
 else:
     print('')
 " 2>/dev/null) || answer=""
