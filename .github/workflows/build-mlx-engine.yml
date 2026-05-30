@@ -290,7 +290,7 @@ jobs:
        needs.build-ubuntu-cpu.result == 'success' ||
        needs.build-macos.result == 'success')
     runs-on: ${{ fromJSON(matrix.runs_on) }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -304,12 +304,12 @@ jobs:
             artifact: mlx-engine-ubuntu-cpu-x64
             runs_on: '"ubuntu-22.04"'
             install_rocm: false
-            model: mlx-community/Qwen3-0.6B-4bit
+            model: mlx-community/Qwen3-1.7B-4bit
           - os: macos-arm64
             artifact: mlx-engine-macos-arm64
             runs_on: '"macos-latest"'
             install_rocm: false
-            model: mlx-community/Qwen3-0.6B-4bit
+            model: mlx-community/Qwen3-1.7B-4bit
     steps:
     - name: ROCm runtime setup (Ubuntu ROCm only)
       if: matrix.install_rocm
@@ -439,7 +439,7 @@ jobs:
           ATTEMPT=$((ATTEMPT + 1))
           echo "=== Inference test attempt $ATTEMPT/$MAX_RETRIES ==="
 
-          response=$(curl -s --max-time 300 -X POST http://127.0.0.1:$PORT/v1/chat/completions \
+          response=$(curl -s --max-time 900 -X POST http://127.0.0.1:$PORT/v1/chat/completions \
             -H "Content-Type: application/json" \
             -d "{
               \"model\": \"${{ matrix.model }}\",
@@ -447,7 +447,7 @@ jobs:
                 {\"role\": \"system\", \"content\": \"You are a math assistant. Answer arithmetic questions with a single number.\"},
                 {\"role\": \"user\", \"content\": \"What is 2+2? Answer with just the number.\"}
               ],
-              \"max_tokens\": 16,
+              \"max_tokens\": 4,
               \"temperature\": 0.0,
               \"stream\": false
             }" 2>&1) || {

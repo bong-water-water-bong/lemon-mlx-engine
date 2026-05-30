@@ -32,20 +32,35 @@ namespace mx = mlx::core;
 
 // ---------------------------------------------------------------------------
 // Dedicated generation stream (matches Python's module-level generation_stream)
+//
+// On Apple platforms, use the default stream to avoid Metal stream
+// thread-affinity bugs ("There is no Stream(gpu, 2) in current thread").
+// The static new_stream() pattern is correct on ROCm and CPU backends but
+// causes MLX Metal to lose track of the stream across requests.
 // ---------------------------------------------------------------------------
 
 mx::Stream& generation_stream() {
+#ifdef __APPLE__
+    // Return a default-constructed stream (equivalent to the default stream)
+    // so that StreamGuard becomes a no-op on Metal.
+    static mx::Stream s;
+#else
     static mx::Stream s = mx::new_stream(mx::default_device());
+#endif
     return s;
 }
 
 // RAII guard to set/restore the default stream for a scope.
 struct StreamGuard {
     mx::Stream old_stream_;
+    bool changed_ = false;
     StreamGuard(mx::Stream s) : old_stream_(mx::default_stream(mx::default_device())) {
-        mx::set_default_stream(s);
+        if (s != old_stream_) {
+            mx::set_default_stream(s);
+            changed_ = true;
+        }
     }
-    ~StreamGuard() { mx::set_default_stream(old_stream_); }
+    ~StreamGuard() { if (changed_) mx::set_default_stream(old_stream_); }
     StreamGuard(const StreamGuard&) = delete;
     StreamGuard& operator=(const StreamGuard&) = delete;
 };
@@ -60,11 +75,13 @@ mx::array TopPSampler::sample_impl(const mx::array& logits) {
     // causing the filter to mask out the correct tokens.
     // Fall back to compiled temperature-scaled categorical sampling.
     //
-    // NOTE: the previous (uncompiled) fallback produced incoherent output
-    // on ROCm even though it was functionally identical to this body.
-    // Wrapping in mx::compile (matching CategoricalSampler::sample_impl)
-    // restores correctness. Likely related to RNG/stream state interaction
-    // when called from TokenIterator::step() under StreamGuard.
+    // On Apple Metal, avoid mx::compile — it captures stream state at
+    // compilation time and becomes unstable across generation requests.
+    // Direct sampling is fast enough on Apple Silicon.
+#ifdef __APPLE__
+    return mx::random::categorical(
+        mx::multiply(logits, mx::array(1.0f / temperature_)));
+#else
     if (!compiled_categorical_) {
         float inv_temp = 1.0f / temperature_;
         compiled_categorical_ = mx::compile(
@@ -74,6 +91,7 @@ mx::array TopPSampler::sample_impl(const mx::array& logits) {
             /*shapeless=*/false);
     }
     return compiled_categorical_({logits})[0];
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -84,6 +102,14 @@ mx::array CategoricalSampler::sample_impl(const mx::array& logits) {
     // Compiled sampling — matches Python's @mx.compile on categorical_sampling.
     // Use shapeless=false (not shapeless=true which crashes RandomBits).
     // Shape is constant during generation so this only compiles once.
+    //
+    // On Apple Metal, avoid mx::compile — it captures stream state at
+    // compilation time and becomes unstable across generation requests.
+    // Direct sampling is fast enough on Apple Silicon.
+#ifdef __APPLE__
+    float inv_temp = 1.0f / temperature_;
+    return mx::random::categorical(mx::multiply(logits, mx::array(inv_temp)));
+#else
     if (!compiled_fn_) {
         float inv_temp = 1.0f / temperature_;
         compiled_fn_ = mx::compile(
@@ -93,6 +119,7 @@ mx::array CategoricalSampler::sample_impl(const mx::array& logits) {
             /*shapeless=*/false);
     }
     return compiled_fn_({logits})[0];
+#endif
 }
 
 // ---------------------------------------------------------------------------
