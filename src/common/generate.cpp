@@ -35,18 +35,12 @@ namespace mx = mlx::core;
 // ---------------------------------------------------------------------------
 
 mx::Stream& generation_stream() {
-#ifdef __APPLE__
-    // On macOS/Metal, avoid custom streams — MLX v0.31.2 has a Metal
-    // stream lifecycle bug where the stream becomes invalid during long
-    // generation ("There is no Stream(gpu, 2) in current thread").
-    // Cache the default stream in a static variable since default_stream()
-    // returns by value and we need a reference.
-    static mx::Stream s = mx::default_stream(mx::Device::gpu);
+    // MLX Metal streams are thread-local (known issue in MLX 0.31.2:
+    // "There is no Stream(gpu, N) in current thread"). Each thread
+    // needs its own stream. This matches the fix applied in mlx-lm
+    // (thread-local generation stream) and mlx-vlm.
+    static thread_local mx::Stream s = mx::new_stream(mx::default_device());
     return s;
-#else
-    static mx::Stream s = mx::new_stream(mx::default_device());
-    return s;
-#endif
 }
 
 // RAII guard to set/restore the default stream for a scope.
