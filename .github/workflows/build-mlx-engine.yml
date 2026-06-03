@@ -94,7 +94,8 @@ jobs:
           -DCLANG_TIDY_EXE=CLANG_TIDY_EXE-NOTFOUND \
           -DMINJA_EXAMPLE_ENABLED=OFF \
           -DMLX_LM_BUILD_TESTS=OFF \
-          -DMLX_LM_BUILD_EXAMPLES=ON
+          -DMLX_LM_BUILD_EXAMPLES=ON \
+          -DHIP_PLATFORM=amd
 
         cmake --build . -j $(nproc)
 
