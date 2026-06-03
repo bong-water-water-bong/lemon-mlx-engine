@@ -34,11 +34,10 @@ FetchContent_Declare(
     mlx
     GIT_REPOSITORY https://github.com/NripeshN/mlx.git
     # Pin MLX to post-PR#7 commit (2026-05-20).
-    # Includes soloish90's 8-bit QMV fix (PR #6) AND the uint4 miscompile
+    # Includes soloish90's 8-bit QMV fix (PR #6), the uint4 miscompile
     # fix (PR #7 — 9e768e4) where global_load_b128 miscompiles on RDNA 3.5
-    # with hipcc 7.13 / LLVM 23. Still avoids clear_streams() which the
-    # ROCm backend doesn't implement yet.
-    GIT_TAG        9e768e453ab1e1906b10c004ecf588200dbbe968
+    # with hipcc 7.13 / LLVM 23, AND the clear_streams() ROCm backend patch.
+    GIT_TAG        94d325ce5fda85f3a3266623d220af4e3a873fb6
     GIT_SHALLOW    FALSE
 )
 FetchContent_MakeAvailable(mlx)
