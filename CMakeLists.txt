@@ -43,26 +43,6 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(mlx)
 
-# Apply ROCm fixes patch to the MLX fork
-if(NOT APPLE AND MLX_BUILD_ROCM)
-    set(MLX_PATCH_DIR "${CMAKE_CURRENT_SOURCE_DIR}/patches")
-    if(EXISTS "${MLX_PATCH_DIR}/mlx-rocm-fixes.patch")
-        message(STATUS "Applying ROCm fixes to MLX fork...")
-        execute_process(
-            COMMAND ${GIT_EXECUTABLE} apply --verbose "${MLX_PATCH_DIR}/mlx-rocm-fixes.patch"
-            WORKING_DIRECTORY "${mlx_SOURCE_DIR}"
-            RESULT_VARIABLE PATCH_RESULT
-        )
-        if(PATCH_RESULT EQUAL 0)
-            message(STATUS "ROCm fixes applied successfully")
-        else()
-            message(WARNING "Failed to apply ROCm fixes (may already be applied)")
-        endif()
-    else()
-        message(WARNING "ROCm patch file not found at ${MLX_PATCH_DIR}/mlx-rocm-fixes.patch")
-    endif()
-endif()
-
 # nlohmann/json (MLX may already provide this)
 if(NOT TARGET nlohmann_json::nlohmann_json)
     FetchContent_Declare(
