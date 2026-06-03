@@ -85,17 +85,36 @@ jobs:
         key: mlx-src-linux-${{ runner.name }}-${{ hashFiles('CMakeLists.txt') }}
 
     - name: Build MLX Engine
+      env:
+        ROCM_VER: ${{ env.ROCM_VERSION }}
+        ROCM_ARCH: ${{ env.ROCM_ARCH }}
       run: |
+        ROCM_VER="${{ env.ROCM_VERSION }}"
+        ROCM_ARCH="${{ env.ROCM_ARCH }}"
+        export HIP_PATH=/opt/rocm/core-${ROCM_VER}
+        export ROCM_PATH=/opt/rocm/core-${ROCM_VER}
+        export PATH="/opt/rocm/core-${ROCM_VER}/bin:/opt/rocm/core-${ROCM_VER}/lib/llvm/bin:$PATH"
+
+        # Pin clang (ROCm 7.13 = clang 23) to GCC 13's libstdc++.
+        GCC_INSTALL_DIR="/usr/lib/gcc/x86_64-linux-gnu/13"
+
         mkdir -p build && cd build
 
         cmake .. -G Ninja \
           -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_C_COMPILER=clang \
+          -DCMAKE_CXX_COMPILER=clang++ \
+          -DCMAKE_HIP_COMPILER=hipcc \
+          -DCMAKE_PREFIX_PATH=/opt/rocm/core-${ROCM_VER} \
+          -DCMAKE_HIP_ARCHITECTURES="${ROCM_ARCH}" \
+          -DCMAKE_C_FLAGS="--gcc-install-dir=${GCC_INSTALL_DIR}" \
+          -DCMAKE_CXX_FLAGS="--gcc-install-dir=${GCC_INSTALL_DIR}" \
+          -DCMAKE_HIP_FLAGS="--gcc-install-dir=${GCC_INSTALL_DIR}" \
           -DCMAKE_CXX_CLANG_TIDY= \
           -DCLANG_TIDY_EXE=CLANG_TIDY_EXE-NOTFOUND \
           -DMINJA_EXAMPLE_ENABLED=OFF \
           -DMLX_LM_BUILD_TESTS=OFF \
-          -DMLX_LM_BUILD_EXAMPLES=ON \
-          -DHIP_PLATFORM=amd
+          -DMLX_LM_BUILD_EXAMPLES=ON
 
         cmake --build . -j $(nproc)
 
