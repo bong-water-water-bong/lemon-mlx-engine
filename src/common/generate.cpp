@@ -35,17 +35,32 @@ namespace mx = mlx::core;
 // ---------------------------------------------------------------------------
 
 mx::Stream& generation_stream() {
-    static mx::Stream s = mx::new_stream(mx::default_device());
+    // MLX Metal streams are thread-local (known issue in MLX 0.31.2:
+    // "There is no Stream(gpu, N) in current thread"). Each thread
+    // needs its own stream. This matches the fix applied in mlx-lm
+    // (thread-local generation stream) and mlx-vlm.
+    static thread_local mx::Stream s = mx::new_stream(mx::default_device());
     return s;
 }
 
 // RAII guard to set/restore the default stream for a scope.
+// On Apple, skip stream switching to avoid Metal thread-affinity issues.
 struct StreamGuard {
     mx::Stream old_stream_;
+    bool changed_ = false;
     StreamGuard(mx::Stream s) : old_stream_(mx::default_stream(mx::default_device())) {
-        mx::set_default_stream(s);
+#ifndef __APPLE__
+        if (s != old_stream_) {
+            mx::set_default_stream(s);
+            changed_ = true;
+        }
+#endif
     }
-    ~StreamGuard() { mx::set_default_stream(old_stream_); }
+    ~StreamGuard() {
+#ifndef __APPLE__
+        if (changed_) mx::set_default_stream(old_stream_);
+#endif
+    }
     StreamGuard(const StreamGuard&) = delete;
     StreamGuard& operator=(const StreamGuard&) = delete;
 };
@@ -55,16 +70,17 @@ struct StreamGuard {
 // ---------------------------------------------------------------------------
 
 mx::array TopPSampler::sample_impl(const mx::array& logits) {
-    // top-p filtering is disabled: argsort + put_along_axis + take_along_axis
-    // on large vocab (151936) produces wrong results on the ROCm backend,
-    // causing the filter to mask out the correct tokens.
+    // top-p filtering is disabled; argsort + take_along_axis on large vocab
+    // produces incorrect results. Investigation needed for re-enablement.
     // Fall back to compiled temperature-scaled categorical sampling.
     //
-    // NOTE: the previous (uncompiled) fallback produced incoherent output
-    // on ROCm even though it was functionally identical to this body.
-    // Wrapping in mx::compile (matching CategoricalSampler::sample_impl)
-    // restores correctness. Likely related to RNG/stream state interaction
-    // when called from TokenIterator::step() under StreamGuard.
+    // On Apple Metal, avoid mx::compile — it captures stream state at
+    // compilation time and becomes unstable across generation requests.
+    // Direct sampling is fast enough on Apple Silicon.
+#ifdef __APPLE__
+    return mx::random::categorical(
+        mx::multiply(logits, mx::array(1.0f / temperature_)));
+#else
     if (!compiled_categorical_) {
         float inv_temp = 1.0f / temperature_;
         compiled_categorical_ = mx::compile(
@@ -74,6 +90,7 @@ mx::array TopPSampler::sample_impl(const mx::array& logits) {
             /*shapeless=*/false);
     }
     return compiled_categorical_({logits})[0];
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -84,6 +101,14 @@ mx::array CategoricalSampler::sample_impl(const mx::array& logits) {
     // Compiled sampling — matches Python's @mx.compile on categorical_sampling.
     // Use shapeless=false (not shapeless=true which crashes RandomBits).
     // Shape is constant during generation so this only compiles once.
+    //
+    // On Apple Metal, avoid mx::compile — it captures stream state at
+    // compilation time and becomes unstable across generation requests.
+    // Direct sampling is fast enough on Apple Silicon.
+#ifdef __APPLE__
+    float inv_temp = 1.0f / temperature_;
+    return mx::random::categorical(mx::multiply(logits, mx::array(inv_temp)));
+#else
     if (!compiled_fn_) {
         float inv_temp = 1.0f / temperature_;
         compiled_fn_ = mx::compile(
@@ -93,6 +118,7 @@ mx::array CategoricalSampler::sample_impl(const mx::array& logits) {
             /*shapeless=*/false);
     }
     return compiled_fn_({logits})[0];
+#endif
 }
 
 // ---------------------------------------------------------------------------

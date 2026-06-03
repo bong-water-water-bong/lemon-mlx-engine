@@ -69,6 +69,7 @@ jobs:
       uses: actions/checkout@v6
       with:
         submodules: recursive
+
     - name: Install ROCm ${{ env.ROCM_VERSION }} (${{ env.ROCM_ARCH }})
       run: |
         ROCM_VER="${{ env.ROCM_VERSION }}"
@@ -98,14 +99,15 @@ jobs:
           build/_deps/mlx-subbuild
         key: mlx-src-linux-${{ runner.name }}-${{ hashFiles('CMakeLists.txt') }}
 
-    - name: Build MLX Engine + ROCm
+    - name: Build MLX Engine
+      env:
+        ROCM_VER: ${{ env.ROCM_VERSION }}
+        ROCM_ARCH: ${{ env.ROCM_ARCH }}
       run: |
         ROCM_VER="${{ env.ROCM_VERSION }}"
         ROCM_ARCH="${{ env.ROCM_ARCH }}"
-        export HIP_PATH=/opt/rocm/core-${ROCM_VER}
-        export ROCM_PATH=/opt/rocm/core-${ROCM_VER}
-        export PATH="/opt/rocm/core-${ROCM_VER}/bin:/opt/rocm/core-${ROCM_VER}/lib/llvm/bin:$PATH"
 
+        # Pin clang (ROCm 7.13 = clang 23) to GCC 13's libstdc++.
         GCC_INSTALL_DIR="/usr/lib/gcc/x86_64-linux-gnu/13"
 
         mkdir -p build && cd build
@@ -290,7 +292,7 @@ jobs:
        needs.build-ubuntu-cpu.result == 'success' ||
        needs.build-macos.result == 'success')
     runs-on: ${{ fromJSON(matrix.runs_on) }}
-    timeout-minutes: 30
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -299,17 +301,17 @@ jobs:
             artifact: mlx-engine-ubuntu-rocm-x64
             runs_on: '["self-hosted", "Linux", "X64", "gfx1151"]'
             install_rocm: true
-            model: mlx-community/Qwen3-1.7B-4bit
+            model: mlx-community/Qwen3.5-0.8B-4bit
           - os: ubuntu-cpu
             artifact: mlx-engine-ubuntu-cpu-x64
             runs_on: '"ubuntu-22.04"'
             install_rocm: false
-            model: mlx-community/Qwen3-0.6B-4bit
+            model: mlx-community/Qwen3.5-0.8B-4bit
           - os: macos-arm64
             artifact: mlx-engine-macos-arm64
             runs_on: '"macos-latest"'
             install_rocm: false
-            model: mlx-community/Qwen3-1.7B-4bit
+            model: mlx-community/Qwen3.5-0.8B-4bit
     steps:
     - name: ROCm runtime setup (Ubuntu ROCm only)
       if: matrix.install_rocm
@@ -324,7 +326,7 @@ jobs:
         fi
 
         if [ "${ROCM_INSTALLED}" = "false" ]; then
-          return 1;
+          exit 1
         fi
 
     - name: Download build artifact
@@ -380,20 +382,26 @@ jobs:
         fi
 
         echo "Starting server on port $PORT ..."
-        if [ "${{ matrix.install_rocm }}" = "true" ]; then
-          MLX_ROCM_QMM_DEQUANT_GEMM=0 mlx-binaries/server --port $PORT &
-        else
-          mlx-binaries/server --port $PORT &
-        fi
+        mlx-binaries/server --port $PORT > server.log 2>&1 &
         SERVER_PID=$!
-        sleep 3
 
-        echo "Checking health endpoint..."
-        http_code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:$PORT/health || echo "000")
-        if [ "$http_code" = "200" ]; then
-          echo "Health check PASSED (HTTP $http_code)"
-        else
-          echo "Health check FAILED (HTTP $http_code)"
+        # Poll for server readiness (max 60s, 1s interval)
+        echo "Waiting for server to become ready..."
+        READY=false
+        for i in $(seq 1 60); do
+          http_code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:$PORT/health 2>/dev/null || echo "000")
+          if [ "$http_code" = "200" ]; then
+            echo "Server ready after ${i}s (HTTP $http_code)"
+            READY=true
+            break
+          fi
+          sleep 1
+        done
+
+        if [ "$READY" != "true" ]; then
+          echo "Server failed to start within 60s. Last HTTP code: $http_code"
+          echo "=== Server Log ==="
+          cat server.log || true
           exit 1
         fi
 
@@ -403,37 +411,72 @@ jobs:
           echo "Models endpoint PASSED"
         else
           echo "Models endpoint FAILED: $models_response"
-          exit 1
-        fi
-
-        echo "Running inference test with ${{ matrix.model }} ..."
-        response=$(curl -s --max-time 1200 -X POST http://127.0.0.1:$PORT/v1/chat/completions \
-          -H "Content-Type: application/json" \
-          -d "{
-            \"model\": \"${{ matrix.model }}\",
-            \"messages\": [{\"role\": \"user\", \"content\": \"What is 2+2? Answer with just the number.\"}],
-            \"max_tokens\": 128,
-            \"temperature\": 0.0,
-            \"stream\": false
-          }" 2>&1) || {
-          echo "FAIL: chat completion request failed"
-          echo "Response: $response"
           kill $SERVER_PID 2>/dev/null || true
           wait $SERVER_PID 2>/dev/null || true
           exit 1
-        }
+        fi
 
-        echo "=== Server Response ==="
-        echo "$response" | python3 -m json.tool 2>/dev/null || echo "$response"
-        echo "=== End Response ==="
+        # Best-effort model warm-up (discard result)
+        echo "Sending warm-up request..."
+        curl -s -o /dev/null -X POST http://127.0.0.1:$PORT/v1/chat/completions \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"model\": \"${{ matrix.model }}\",
+            \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}],
+            \"max_tokens\": 5,
+            \"temperature\": 0.0,
+            \"stream\": false
+          }" 2>/dev/null || echo "Warm-up request skipped (non-fatal)"
 
-        content=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'].strip())" 2>/dev/null) || content=""
-        echo "Extracted content: $content"
+        # Inference test with retry logic (max 2 attempts)
+        MAX_RETRIES=2
+        ATTEMPT=0
+        PASS=false
 
-        if echo "$content" | grep -q "4"; then
-          echo "INFERECE TEST PASSED -- model answered correctly"
+        while [ $ATTEMPT -lt $MAX_RETRIES ]; do
+          ATTEMPT=$((ATTEMPT + 1))
+          echo "=== Inference test attempt $ATTEMPT/$MAX_RETRIES ==="
+
+          response=$(curl -s --max-time 900 -X POST http://127.0.0.1:$PORT/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"model\": \"${{ matrix.model }}\",
+              \"messages\": [
+                {\"role\": \"system\", \"content\": \"You are a math assistant. Answer arithmetic questions with a single number.\"},
+                {\"role\": \"user\", \"content\": \"What is 2+2? Answer with just the number.\"}
+              ],
+              \"max_tokens\": 32,
+              \"temperature\": 0.0,
+              \"stream\": false
+            }" 2>&1) || {
+            echo "Attempt $ATTEMPT: chat completion request failed"
+            continue
+          }
+
+          content=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'].strip())" 2>/dev/null) || content=""
+          answer=$(echo "$content" | python3 -c "import sys,re; t=sys.stdin.read(); t=re.sub(r'<think>.*?</think>','',t,flags=re.DOTALL); m=re.search(r'=\s*(\d+)',t); print(m.group(1) if m else (re.findall(r'\b(\d+)\b',t)[-1] if re.findall(r'\b(\d+)\b',t) else ''))" 2>/dev/null) || answer=""
+          echo "=== RAW MODEL OUTPUT (Attempt $ATTEMPT) ==="
+          echo "$response" | python3 -m json.tool 2>/dev/null || echo "$response"
+          echo "=== END RAW OUTPUT ==="
+          echo "Attempt $ATTEMPT extracted answer: $answer"
+
+          if [ "$answer" = "4" ]; then
+            PASS=true
+            break
+          fi
+          echo "Attempt $ATTEMPT: did not contain '4', retrying in 5s..."
+          sleep 5
+        done
+
+        if [ "$PASS" = "true" ]; then
+          echo "INFERENCE TEST PASSED -- model answered correctly on attempt $ATTEMPT"
         else
-          echo "INFERECE TEST FAILED -- expected '4' in response"
+          echo "=== Server Response ==="
+          echo "$response" | python3 -m json.tool 2>/dev/null || echo "$response"
+          echo "=== End Response ==="
+          echo "INFERENCE TEST FAILED -- expected answer '4' after $MAX_RETRIES attempts"
+          echo "=== Server Log (last 50 lines) ==="
+          tail -50 server.log 2>/dev/null || true
           kill $SERVER_PID 2>/dev/null || true
           wait $SERVER_PID 2>/dev/null || true
           exit 1

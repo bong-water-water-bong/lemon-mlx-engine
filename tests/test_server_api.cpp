@@ -1,6 +1,6 @@
 // Integration tests for the OpenAI-compatible server API.
 // Uses cpp-httplib client to make real HTTP requests.
-// Requires a cached MLX model (mlx-community/Qwen3-1.7B-4bit by default).
+// Requires a cached MLX model (mlx-community/Qwen3.5-0.8B-4bit by default).
 //
 // Tag: [server-api] — can be skipped in CI if no model is available.
 
@@ -25,7 +25,7 @@ using json = nlohmann::json;
 // ---------------------------------------------------------------------------
 
 // Small model for integration tests — fast to load, enough for 2+2.
-static const char* TEST_MODEL = "mlx-community/Qwen3-1.7B-4bit";
+static const char* TEST_MODEL = "mlx-community/Qwen3.5-0.8B-4bit";
 static const int TEST_PORT = 18321; // unlikely to conflict
 
 static bool model_is_cached() {
@@ -126,8 +126,8 @@ TEST_CASE("HubApi resolve_cache_path handles both -- and - formats", "[server-ap
     auto& hub = mlx_lm::HubApi::shared();
 
     // If we have a model in the old format, it should still resolve
-    if (hub.is_cached("mlx-community/Qwen3-1.7B-4bit")) {
-        auto path = hub.model_directory("mlx-community/Qwen3-1.7B-4bit");
+    if (hub.is_cached("mlx-community/Qwen3.5-0.8B-4bit")) {
+        auto path = hub.model_directory("mlx-community/Qwen3.5-0.8B-4bit");
         REQUIRE(!path.empty());
         REQUIRE(std::filesystem::exists(path));
         REQUIRE(std::filesystem::exists(path + "/config.json"));
@@ -185,7 +185,7 @@ TEST_CASE("GET /v1/models lists available MLX models", "[server-api][endpoints]"
     bool found = false;
     for (const auto& m : body["data"]) {
         if (m["id"].get<std::string>() == TEST_MODEL ||
-            m["id"].get<std::string>().find("Qwen3-1.7B-4bit") != std::string::npos) {
+            m["id"].get<std::string>().find("Qwen3.5-0.8B-4bit") != std::string::npos) {
             found = true;
             break;
         }

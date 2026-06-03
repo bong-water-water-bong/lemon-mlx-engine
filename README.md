@@ -22,19 +22,12 @@ Run LLMs locally on **Apple M-series**, **AMD GPUs** (Linux/Windows), and CPU --
 - C++17 compiler
 - libcurl
 - Rust toolchain (for tokenizers-cpp)
-- ROCm (for AMD GPU builds)
 
 ## Build
 
 ```bash
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j
-```
-
-For AMD GPU (ROCm):
-```bash
-cmake .. -DCMAKE_BUILD_TYPE=Release -DMLX_BUILD_ROCM=ON
 make -j
 ```
 
@@ -48,7 +41,7 @@ Models are specified as HuggingFace repo IDs (auto-downloaded on first use) or l
 
 ```bash
 # Basic usage -- downloads the model on first run
-./chat mlx-community/Qwen3-1.7B-4bit
+./chat mlx-community/Qwen3.5-0.8B-4bit
 
 # With system prompt and tuned sampling
 ./chat mlx-community/Qwen3-4B-4bit \

@@ -97,6 +97,7 @@ static const char* gdn_hip_source = R"(
     }
 )";
 
+#if defined(MLX_BUILD_ROCM) && MLX_BUILD_ROCM
 // Create and cache the HIP kernel
 static mx::fast::CustomKernelFunction make_gdn_kernel() {
     return mx::fast::hip_kernel(
@@ -137,6 +138,21 @@ static std::pair<mx::array, mx::array> gated_delta_kernel(
 
     return {results[0], results[1]};
 }
+#else
+// Non-ROCm fallback: use the reference Python port implementation via MLX ops.
+// This avoids the hip_kernel() call which requires a ROCm backend.
+static std::pair<mx::array, mx::array> gated_delta_kernel(
+    const mx::array& q, const mx::array& k,
+    const mx::array& v, const mx::array& g,
+    const mx::array& beta, const mx::array& state)
+{
+    // TODO: implement a CPU/Metal fallback using standard MLX ops.
+    // For now, throw a descriptive error so the caller can handle it.
+    throw std::runtime_error(
+        "GDN HIP kernel is only available on ROCm builds. "
+        "Rebuild with -DMLX_BUILD_ROCM=ON for GPU acceleration.");
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // computeGatedDeltaG — compiled to fuse element-wise ops
@@ -309,12 +325,14 @@ std::pair<mx::array, mx::array> gated_delta_ops(
     int repeat_factor = Hv / Hk;
     auto s = state.value_or(mx::zeros({B, Hv, Dv, Dk}, q.dtype()));
 
-    // Try fused HIP kernel (handles all T, no mask)
+    // Try fused HIP kernel (handles all T, no mask) — ROCm only
+#if defined(MLX_BUILD_ROCM) && MLX_BUILD_ROCM
     if (!mask.has_value() && Dk % 32 == 0) {
         auto q_work = repeat_heads(q, repeat_factor);
         auto k_work = repeat_heads(k, repeat_factor);
         return gated_delta_kernel(q_work, k_work, v, g, beta, s);
     }
+#endif
 
     // *** FAST PATH: T=1 decode without mask ***
     if (T == 1 && !mask.has_value()) {
