@@ -200,7 +200,6 @@ class Qwen3NextModel
     std::optional<mlx::core::array> lm_head_weight_;
     std::vector<int> kv_heads_;
 
-    // MTP scaffolding (I7 sub-task 1): stash mtp.* weights.
     std::unordered_map<std::string, mlx::core::array> mtp_weights_;
 
     PrepareResult prepare_impl(const LMInput& input, std::vector<KVCache>& cache, int window_size);

@@ -203,9 +203,6 @@ class Qwen35Model
     std::optional<mlx::core::array> lm_head_weight_;
     std::vector<int> kv_heads_;
 
-    // MTP scaffolding: weights with key prefix "mtp." are stashed here at load
-    // time (sub-task 1 of I7). The MTPHead module (see mtp_head.h) is wired up
-    // by higher-level code when `has_mtp()` is true.
     std::unordered_map<std::string, mlx::core::array> mtp_weights_;
 
     PrepareResult prepare_impl(const LMInput& input, std::vector<KVCache>& cache, int window_size);

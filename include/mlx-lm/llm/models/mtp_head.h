@@ -1,26 +1,3 @@
-// Copyright (c) 2024-2026 Apple Inc. -- Ported to C++
-// MTP (Multi-Token Prediction) head -- I7 sub-task 2.
-//
-// Port of MTPHead + MTPDecoderLayer from mlx-lm-private qwen35_mtp branch:
-//   mlx_lm/models/qwen3_5.py:310 MTPDecoderLayer
-//   mlx_lm/models/qwen3_5.py:336 MTPHead
-//
-// Structure:
-//   pre_fc_norm_hidden:    RMSNorm(H)
-//   pre_fc_norm_embedding: RMSNorm(H)
-//   fc:                    Linear(2*H -> H, no bias)
-//   layers[0]:             MTPDecoderLayer = full attention + MLP
-//   norm:                  RMSNorm(H)
-//
-// Used by mtp_speculative_generate_step to draft a single follow-on token
-// from (last_hidden_state, last_emitted_token) without re-running the trunk.
-//
-// Scaffolding scope: self-contained, model-agnostic attention + MLP block
-// so we can build + smoke without dragging in Qwen35Model's full TU graph
-// (which has its own dead-code / CMake-not-listed quirks). The real wiring
-// for production will plug back into model-specific Attention / SparseMoE
-// classes once they are folded into the build properly.
-
 #pragma once
 
 #include <mlx-lm/common/kv_cache.h>
@@ -32,9 +9,6 @@
 
 namespace mlx_lm {
 
-// Minimal configuration block for MTPHead. Mirrors the subset of
-// Qwen35Configuration that MTP actually needs. We keep this self-contained
-// so MTPHead can be constructed in tests without pulling in Qwen35Model.
 struct MTPHeadConfig {
     int hidden_size = 0;
     int intermediate_size = 0;
@@ -50,10 +24,6 @@ struct MTPHeadConfig {
     }
 };
 
-// Single full-attention decoder layer for the MTP head. Mirrors
-// `MTPDecoderLayer.__call__` from qwen3_5.py:325. Self-attention + MLP +
-// pre/post RMSNorm; no GatedDeltaNet variant -- MTP always uses standard
-// attention per the upstream MTP reference.
 class MTPDecoderLayer {
 public:
     explicit MTPDecoderLayer(const MTPHeadConfig& args);
@@ -108,8 +78,7 @@ public:
 
     std::unordered_map<std::string, mlx::core::array*> weight_map();
 
-    // Load mtp.* weights as harvested by the model loader (I7 sub-task 1).
-    // Strips any prefix up to and including "mtp.".
+    // Load mtp.* weights. Strips prefix "mtp.".
     void load_mtp_weights(
         const std::unordered_map<std::string, mlx::core::array>& mtp_weights);
 
