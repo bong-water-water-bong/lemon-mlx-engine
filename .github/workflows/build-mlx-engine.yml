@@ -382,11 +382,11 @@ jobs:
         fi
 
         echo "Starting server on port $PORT ..."
-        if [ "${{ matrix.install_rocm }}" = "true" ]; then
-          MLX_ROCM_QMM_DEQUANT_GEMM=0 mlx-binaries/server --port $PORT > server.log 2>&1 &
-        else
-          mlx-binaries/server --port $PORT > server.log 2>&1 &
-        fi
+        # NOTE: ROCm smoke test inference failures with 4-bit quantized models
+        # are caused by an upstream MLX ROCm quantized matmul kernel bug.
+        # No env var workaround exists in the MLX codebase.
+        # Tracking upstream for a fix.
+        mlx-binaries/server --port $PORT > server.log 2>&1 &
         SERVER_PID=$!
 
         # Poll for server readiness (max 60s, 1s interval)
