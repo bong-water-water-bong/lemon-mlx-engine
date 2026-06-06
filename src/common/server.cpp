@@ -212,6 +212,22 @@ struct Server::Impl {
             params.use_mtp = chat_req.use_mtp;
         }
 
+        // Diagnostic: log MTP activation state for first request.
+        static std::once_flag mtp_diag_once;
+        std::call_once(mtp_diag_once, [&]() {
+            bool has_mtp_head = false;
+            model->perform_read([&](const ModelContext& ctx) {
+                has_mtp_head = (ctx.get_mtp_head_fn != nullptr);
+            });
+            std::cerr << "[MTP_DIAG] defaults.use_mtp=" << defaults.use_mtp
+                      << " chat_req.use_mtp=" << chat_req.use_mtp
+                      << " params.use_mtp=" << params.use_mtp
+                      << " model.get_mtp_head_fn="
+                      << (has_mtp_head ? "non-null" : "NULL")
+                      << " model_id=" << model->model_id()
+                      << "\n";
+        });
+
         if (chat_req.stream) {
             handle_chat_stream(res, model, chat_req, params);
         } else {

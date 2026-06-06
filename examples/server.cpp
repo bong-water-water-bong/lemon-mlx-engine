@@ -46,6 +46,7 @@ struct CliArgs {
     bool no_download = false;
     int max_loaded = 1;
     bool use_mtp = false;
+    int n_draft_tokens = 3;
 };
 
 static CliArgs parse_args(int argc, char* argv[]) {
@@ -81,6 +82,8 @@ static CliArgs parse_args(int argc, char* argv[]) {
             args.ctx_size = std::stoi(argv[++i]);
         } else if (flag == "--use-mtp") {
             args.use_mtp = true;
+        } else if (flag == "--n-draft-tokens" && i + 1 < argc) {
+            args.n_draft_tokens = std::stoi(argv[++i]);
         } else if (flag == "-h" || flag == "--help") {
             std::cerr << "Usage: " << argv[0] << " [model_id_or_directory] [options]\n"
                       << "\n"
@@ -102,6 +105,7 @@ static CliArgs parse_args(int argc, char* argv[]) {
                       << "  --kv-group-size N       KV cache quant group size (default: 64)\n"
                       << "  --ctx-size N            Pre-allocate KV cache (0=auto)\n"
                       << "  --use-mtp               Enable MTP speculative decoding (model must have mtp.* weights)\n"
+                      << "  --n-draft-tokens N      MTP draft tokens per step (default: 3)\n"
                       << "\n"
                       << "Endpoints:\n"
                       << "  GET  /health              Health check\n"
@@ -165,6 +169,7 @@ int main(int argc, char* argv[]) {
             default_params.ctx_size = args.ctx_size;
         }
         default_params.use_mtp = args.use_mtp;
+        default_params.n_draft_tokens = args.n_draft_tokens;
         manager->set_default_params(default_params);
 
         // If a model was specified, pre-load it.

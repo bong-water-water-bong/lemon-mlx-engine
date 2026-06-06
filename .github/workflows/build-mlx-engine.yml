@@ -401,7 +401,7 @@ jobs:
         # Conditionally enable MTP speculative decoding
         MTP_FLAG=""
         if [ "${{ matrix.use_mtp }}" = "true" ]; then
-          MTP_FLAG="--use-mtp"
+          MTP_FLAG="--use-mtp --n-draft-tokens 3"
         fi
 
         # Disable thinking/reasoning for deterministic, fast answers in smoke tests
@@ -554,6 +554,19 @@ jobs:
             print('  (no server.log found)', file=sys.stderr)
             content = ''
 
+        # Extract MTP diagnostic line.
+        mtp_diag = {}
+        diag_m = re.search(r'\[MTP_DIAG\]\s+defaults\.use_mtp=(\S+)\s+chat_req\.use_mtp=(\S+)\s+params\.use_mtp=(\S+)\s+model\.get_mtp_head_fn=(\S+)\s+model_id=(\S+)', content)
+        if diag_m:
+            mtp_diag = {
+                'mtp_default': diag_m.group(1),
+                'request_use_mtp': diag_m.group(2),
+                'params_use_mtp': diag_m.group(3),
+                'get_mtp_head_fn': diag_m.group(4),
+                'model_id': diag_m.group(5),
+            }
+            print(f\"  [MTP_DIAG] use_mtp={mtp_diag['params_use_mtp']} get_mtp_head_fn={mtp_diag['get_mtp_head_fn']}\", file=sys.stderr)
+
         results = []
         # Split on [TPS] markers to get each generation block
         tps_blocks = re.split(r'(?=\[TPS\])', content)
@@ -589,14 +602,23 @@ jobs:
                     entry['mtp_draft_tokens_accepted'] = int(mtp_m.group(2))
                     entry['mtp_speculative_steps'] = int(mtp_m.group(3))
                     entry['mtp_acceptance_rate_pct'] = float(mtp_m.group(4))
+                if mtp_diag:
+                    entry['mtp_diagnostic'] = mtp_diag
 
                 results.append(entry)
 
         if results:
             with open('benchmark-results-${{ matrix.os }}.json', 'w') as f:
                 json.dump(results, f, indent=2)
+
+            # Print formatted datatable
+            print(f\"  {'Platform':<16} {'Prompt TPS':>12} {'Gen TPS':>10} {'Tokens':>8} {'MTP':>6}\")
+            print(f\"  {'-'*14:<16} {'-'*10:>12} {'-'*8:>10} {'-'*6:>8} {'-'*4:>6}\")
             for r in results:
-                print(f\"  Gen: {r['generation_tps']} tok/s | Prompt: {r['prompt_tps']} tok/s\")
+                mtp_status = 'YES' if r.get('mtp_enabled') else 'no'
+                if r.get('mtp_diagnostic') and r['mtp_diagnostic'].get('get_mtp_head_fn') == 'NULL':
+                    mtp_status = 'NULL'
+                print(f\"  {r['platform']:<16} {r['prompt_tps']:>12.2f} {r['generation_tps']:>10.2f} {r['generation_tokens']:>8} {mtp_status:>6}\")
         else:
             # Write empty result so artifact still uploads
             with open('benchmark-results-${{ matrix.os }}.json', 'w') as f:
@@ -690,6 +712,21 @@ jobs:
 
         with open('benchmarks-latest.json', 'w') as fh:
             json.dump(output, fh, indent=2)
+
+        # Print formatted datatable
+        print()
+        print(f\"  {'Platform':<16} {'Model':<40} {'Gen TPS':>10} {'Tokens':>8} {'MTP':>6} {'Trend':>8}\")
+        print(f\"  {'-'*14:<16} {'-'*38:<40} {'-'*8:>10} {'-'*6:>8} {'-'*4:>6} {'-'*6:>8}\")
+        for r in all_results:
+            model_short = r.get('model', '')[-35:]
+            mtp = 'YES' if r.get('mtp_enabled') else 'no'
+            trend = ''
+            for tw in trend_warnings:
+                if tw['model'] == r.get('model') and tw['platform'] == r.get('platform'):
+                    trend = f\"{tw['direction']} {tw['deviation_pct']}%\"
+                    break
+            print(f\"  {r['platform']:<16} {model_short:<40} {r['generation_tps']:>10.2f} {r['generation_tokens']:>8} {mtp:>6} {trend:>8}\")
+        print()
 
         print(f'Collected {len(all_results)} benchmark results, {len(trend_warnings)} trend warnings')
         "
