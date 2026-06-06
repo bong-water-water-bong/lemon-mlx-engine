@@ -665,6 +665,10 @@ mx::array Qwen35MoEModelInner::operator()(
     return mx::fast::rms_norm(h, norm_weight_, rms_norm_eps_);
 }
 
+mx::array Qwen35MoEModelInner::embed_tokens(const mx::array& input_ids) const {
+    return mx::take(embed_tokens_weight_, input_ids, 0);
+}
+
 mx::array Qwen35MoEModelInner::embed_as_linear(const mx::array& x) const {
     return mx::matmul(x, mx::transpose(embed_tokens_weight_));
 }

@@ -230,6 +230,7 @@ public:
         const std::optional<mlx::core::array>& visual_mask = std::nullopt,
         const std::vector<mlx::core::array>* deepstack_embeds = nullptr);
 
+    mlx::core::array embed_tokens(const mlx::core::array& input_ids) const;
     mlx::core::array embed_as_linear(const mlx::core::array& x) const;
     mlx::core::array apply_lm_head(const mlx::core::array& hidden) const;
     std::unordered_map<std::string, mlx::core::array*> weight_map();

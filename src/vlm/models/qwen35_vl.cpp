@@ -410,11 +410,13 @@ mx::array Qwen35VLVisionModel::compute_positional_embeddings(const std::vector<T
     }
 
     // Concatenate all corner data
-    std::vector<mx::array> corner_indices(4);
-    std::vector<mx::array> corner_weights(4);
+    std::vector<mx::array> corner_indices;
+    corner_indices.reserve(4);
+    std::vector<mx::array> corner_weights;
+    corner_weights.reserve(4);
     for (int c = 0; c < 4; ++c) {
-        corner_indices[c] = mx::astype(mx::concatenate(ci_parts[c], 0), mx::int32);
-        corner_weights[c] = mx::astype(mx::concatenate(cw_parts[c], 0), pos_embed_weight_.dtype());
+        corner_indices.push_back(mx::astype(mx::concatenate(ci_parts[c], 0), mx::int32));
+        corner_weights.push_back(mx::astype(mx::concatenate(cw_parts[c], 0), pos_embed_weight_.dtype()));
     }
 
     // Batch embedding lookup: weighted sum of 4 corners
