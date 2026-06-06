@@ -303,12 +303,14 @@ jobs:
             install_rocm: true
             model: mlx-community/Qwen3.5-0.8B-4bit
             use_mtp: false
+            no_think: false
           - os: ubuntu-mtp
             artifact: mlx-engine-ubuntu-rocm-x64
             runs_on: '["self-hosted", "Linux", "X64", "gfx1151"]'
             install_rocm: true
             model: mlx-community/Qwen3.5-4B-MTP-4bit
             use_mtp: true
+            no_think: true
             timeout_minutes: 30
           - os: ubuntu-cpu
             artifact: mlx-engine-ubuntu-cpu-x64
@@ -316,12 +318,14 @@ jobs:
             install_rocm: false
             model: mlx-community/Qwen3.5-0.8B-4bit
             use_mtp: false
+            no_think: false
           - os: macos-arm64
             artifact: mlx-engine-macos-arm64
             runs_on: '"macos-latest"'
             install_rocm: false
             model: mlx-community/Qwen3.5-0.8B-4bit
             use_mtp: false
+            no_think: false
     steps:
     - name: ROCm runtime setup (Ubuntu ROCm only)
       if: matrix.install_rocm
@@ -400,6 +404,12 @@ jobs:
           MTP_FLAG="--use-mtp"
         fi
 
+        # Disable thinking/reasoning for deterministic, fast answers in smoke tests
+        NO_THINK_FLAG=""
+        if [ "${{ matrix.no_think }}" = "true" ]; then
+          NO_THINK_FLAG="--no-think"
+        fi
+
         # Increase readiness timeout for MTP models
         if [ "${{ matrix.use_mtp }}" = "true" ]; then
           READY_TIMEOUT=180
@@ -423,7 +433,7 @@ jobs:
         # are caused by an upstream MLX ROCm quantized matmul kernel bug.
         # No env var workaround exists in the MLX codebase.
         # Tracking upstream for a fix.
-        mlx-binaries/server --port $PORT $MTP_FLAG > server.log 2>&1 &
+        mlx-binaries/server --port $PORT $MTP_FLAG $NO_THINK_FLAG > server.log 2>&1 &
         SERVER_PID=$!
 
         # Poll for server readiness
