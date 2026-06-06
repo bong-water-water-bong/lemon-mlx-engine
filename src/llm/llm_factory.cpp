@@ -384,7 +384,7 @@ ModelContext load_mtp_delta_model(
     int mtp_keys = 0;
     for (auto& [key, value] : delta_weights) {
         std::string prefixed = "mtp." + key;
-        weights[prefixed] = std::move(value);
+        weights.insert_or_assign(prefixed, std::move(value));
         mtp_keys++;
     }
     std::cerr << "[MTP] Merged " << mtp_keys << " MTP head weights with base model\n";
