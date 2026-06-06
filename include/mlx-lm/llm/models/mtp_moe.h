@@ -14,8 +14,6 @@
 
 namespace mlx_lm {
 
-namespace mlx_lm {
-
 // Single full-attention decoder layer for the MTP head with MoE MLP.
 // Mirrors MTPDecoderLayer but replaces the dense SwiGLU MLP with a
 // SwitchGLU (sparse MoE) block, matching the trunk model's architecture.
