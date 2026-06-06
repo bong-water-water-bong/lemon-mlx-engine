@@ -126,6 +126,9 @@ add_library(mlx-lm-common
     src/common/chat_template.cpp
     src/common/gated_delta.cpp
 )
+# NOTE: src/common/mtp_delta_kernel.cpp intentionally excluded from build.
+# Contains dead code (mtp_delta_fused / mtp_draft_forward) not wired into
+# generate.cpp. Left on disk for future ROCm optimization work.
 target_link_libraries(mlx-lm-common PUBLIC
     mlx-lm-core
     nlohmann_json::nlohmann_json
@@ -187,6 +190,7 @@ add_library(mlx-lm-llm
     src/llm/models/nemotron_h.cpp
     src/llm/models/granite_moe_hybrid.cpp
     src/llm/models/mtp_head.cpp
+    src/llm/models/mtp_moe.cpp
 )
 target_link_libraries(mlx-lm-llm PUBLIC mlx-lm-common)
 

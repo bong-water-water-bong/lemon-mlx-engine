@@ -23,6 +23,11 @@ struct MTPHeadConfig {
     int rope_dims = 0;      // 0 = resolved via partial_rotary_factor
     float partial_rotary_factor = 0.25f;  // fraction of head dim using rotary
 
+    // MoE-specific fields (zero = dense mode).
+    int num_experts = 0;
+    int num_experts_per_tok = 1;
+    int shared_expert_intermediate_size = 0;
+
     int resolved_head_dim() const {
         return head_dim != 0 ? head_dim : hidden_size / num_attention_heads;
     }
@@ -32,6 +37,8 @@ struct MTPHeadConfig {
             ? rope_dims
             : static_cast<int>(resolved_head_dim() * partial_rotary_factor);
     }
+
+    bool is_moe() const { return num_experts > 0; }
 };
 
 // Single full-attention decoder layer for the MTP head. Mirrors
@@ -74,6 +81,9 @@ class MTPHead {
 public:
     explicit MTPHead(const MTPHeadConfig& args);
 
+    // Factory: create an MTPHead with MoE decoder layer.
+    static MTPHead create_moe(const MTPHeadConfig& args);
+
     // Run one MTP draft step.
     //   hidden_state:    [B, T, H]  -- pre-norm hidden from the trunk
     //   token_embedding: [B, T, H]  -- embed(last_emitted_token)
@@ -98,11 +108,21 @@ public:
         const std::unordered_map<std::string, mlx::core::array>& mtp_weights);
 
 private:
+    // Sentinel constructor — creates MTPHead for MoE use without
+    // initializing dense_layer_, avoiding a wasted SwiGLU allocation
+    // that create_moe() immediately resets.
+    MTPHead(const MTPHeadConfig& args, int /* moe_sentinel */);
+
     MTPHeadConfig args_;
     mlx::core::array pre_fc_norm_hidden_weight_;
     mlx::core::array pre_fc_norm_embedding_weight_;
     mlx::core::array fc_weight_;  // [H, 2*H]
-    MTPDecoderLayer layer_;
+
+    // Dense layer (used when num_experts == 0).
+    std::optional<MTPDecoderLayer> dense_layer_;
+    // MoE layer (used when num_experts > 0).
+    std::unique_ptr<class MTPDecoderLayerMoE> moe_layer_;
+
     mlx::core::array norm_weight_;
 };
 

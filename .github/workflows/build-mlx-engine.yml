@@ -488,19 +488,166 @@ jobs:
 
         echo "SMOKE TEST PASSED -- server started, health check, and inference OK"
 
-        # --- Benchmark: extract TPS / prompt processing metrics from server log ---
+        # --- Benchmark: extract TPS metrics as structured JSON ---
         echo "=== Performance Benchmarks ==="
         echo "${{ matrix.model }}:"
-        grep "\[TPS\]" server.log 2>/dev/null | while IFS= read -r line; do
-          echo "  $line"
-        done
-        if ! grep -q "\[TPS\]" server.log 2>/dev/null; then
-          echo "  (no TPS data found in server log)"
-        fi
+
+        # Parse [TPS] lines from server.log and build benchmark JSON
+        python3 -c "
+        import json, re, sys, os
+        from datetime import datetime, timezone
+
+        model = '${{ matrix.model }}'
+        platform = '${{ matrix.os }}'
+        ts = lines = []
+        try:
+            with open('server.log', 'r') as f:
+                lines = f.readlines()
+        except FileNotFoundError:
+            print('  (no server.log found)', file=sys.stderr)
+
+        results = []
+        for line in lines:
+            m = re.search(r'\[TPS\].*?Prompt:\s+(\d+)\s+tokens.*?([\d.]+)\s+tokens/s.*?([\d.e+-]+)s.*?Generation:\s+(\d+)\s+tokens.*?([\d.]+)\s+tokens/s.*?([\d.e+-]+)s', line, re.DOTALL)
+            if m:
+                prompt_tok = int(m.group(1))
+                prompt_tps = float(m.group(2))
+                prompt_time = float(m.group(3))
+                gen_tok = int(m.group(4))
+                gen_tps = float(m.group(5))
+                gen_time = float(m.group(6))
+
+                # Extract optional MTP metrics
+                mtp_m = re.search(r'MTP:\s+drafts=(\d+)\s+accepted=(\d+)\s+speculative_steps=(\d+)\s+acceptance_rate=([\d.]+)%', line, re.DOTALL)
+                mtp_enabled = mtp_m is not None
+                entry = {
+                    'model': model,
+                    'platform': platform,
+                    'prompt_tokens': prompt_tok,
+                    'generation_tokens': gen_tok,
+                    'prompt_tps': round(prompt_tps, 2),
+                    'generation_tps': round(gen_tps, 2),
+                    'prompt_time_s': round(prompt_time, 4),
+                    'generation_time_s': round(gen_time, 4),
+                    'mtp_enabled': mtp_enabled,
+                    'timestamp': datetime.now(timezone.utc).isoformat()
+                }
+                if mtp_m:
+                    entry['mtp_draft_tokens_proposed'] = int(mtp_m.group(1))
+                    entry['mtp_draft_tokens_accepted'] = int(mtp_m.group(2))
+                    entry['mtp_speculative_steps'] = int(mtp_m.group(3))
+                    entry['mtp_acceptance_rate_pct'] = float(mtp_m.group(4))
+
+                results.append(entry)
+
+        if results:
+            with open('benchmark-results-${{ matrix.os }}.json', 'w') as f:
+                json.dump(results, f, indent=2)
+            for r in results:
+                print(f\"  Gen: {r['generation_tps']} tok/s | Prompt: {r['prompt_tps']} tok/s\")
+        else:
+            # Write empty result so artifact still uploads
+            with open('benchmark-results-${{ matrix.os }}.json', 'w') as f:
+                json.dump([], f)
+            print('  (no TPS data found in server log)')
+        "
         echo "=== End Benchmarks ==="
 
         kill $SERVER_PID 2>/dev/null || true
         wait $SERVER_PID 2>/dev/null || true
+
+    - name: Upload benchmark results
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: bench-results-${{ matrix.os }}
+        path: benchmark-results-${{ matrix.os }}.json
+        retention-days: 30
+
+  collect-benchmarks:
+    needs: [test-simple-math]
+    if: always() && needs.test-simple-math.result == 'success'
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Download all benchmark artifacts
+      uses: actions/download-artifact@v6
+      with:
+        path: ./bench-data
+        pattern: bench-results-*
+        merge-multiple: true
+
+    - name: Merge benchmarks and detect trends
+      run: |
+        set -e
+        python3 -c "
+        import json, glob, os, sys
+        from pathlib import Path
+
+        all_results = []
+        for f in sorted(glob.glob('./bench-data/benchmark-results-*.json')):
+            try:
+                with open(f) as fh:
+                    data = json.load(fh)
+                    if isinstance(data, list):
+                        all_results.extend(data)
+            except Exception as e:
+                print(f'Warning: could not read {f}: {e}', file=sys.stderr)
+
+        if not all_results:
+            print('No benchmark results collected', file=sys.stderr)
+            with open('benchmarks-latest.json', 'w') as fh:
+                json.dump({'results': [], 'trend_warnings': []}, fh, indent=2)
+            sys.exit(0)
+
+        # Group by model+platform for trend detection
+        from collections import defaultdict
+        grouped = defaultdict(list)
+        for r in all_results:
+            key = (r.get('model', ''), r.get('platform', ''))
+            grouped[key].append(r['generation_tps'])
+
+        # Rolling average (last 3 runs) and trend detection
+        trend_warnings = []
+        for (model, platform), tps_values in grouped.items():
+            if len(tps_values) >= 2:
+                # Current run vs rolling average of previous runs
+                current = tps_values[-1]
+                history = tps_values[:-1]
+                # Keep last 3 for rolling average
+                history = history[-3:]
+                avg = sum(history) / len(history)
+                if avg > 0:
+                    deviation = abs(current - avg) / avg
+                    if deviation > 0.15:
+                        direction = 'DOWN' if current < avg else 'UP'
+                        trend_warnings.append({
+                            'model': model,
+                            'platform': platform,
+                            'current_tps': round(current, 2),
+                            'rolling_avg_tps': round(avg, 2),
+                            'deviation_pct': round(deviation * 100, 1),
+                            'direction': direction
+                        })
+                        print(f'WARN: {model} on {platform} generation_tps deviated {deviation*100:.1f}% ({direction}) from {avg:.1f} rolling avg', file=sys.stderr)
+
+        output = {
+            'results': all_results,
+            'trend_warnings': trend_warnings,
+            'collected_at': __import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()
+        }
+
+        with open('benchmarks-latest.json', 'w') as fh:
+            json.dump(output, fh, indent=2)
+
+        print(f'Collected {len(all_results)} benchmark results, {len(trend_warnings)} trend warnings')
+        "
+
+    - name: Upload merged benchmarks
+      uses: actions/upload-artifact@v6
+      with:
+        name: benchmarks-latest
+        path: benchmarks-latest.json
+        retention-days: 90
 
   create-release:
     needs: [prepare-matrix, build-ubuntu-rocm, build-ubuntu-cpu, build-macos, test-simple-math]

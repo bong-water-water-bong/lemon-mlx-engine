@@ -173,6 +173,11 @@ struct GenerateCompletionInfo {
     double prompt_time = 0.0;        // seconds
     double generation_time = 0.0;    // seconds
 
+    // MTP speculative decoding metrics (populated when use_mtp is true).
+    int mtp_draft_tokens_proposed = 0;
+    int mtp_draft_tokens_accepted = 0;
+    int mtp_speculative_steps = 0;
+
     double prompt_tokens_per_second() const {
         return prompt_time > 0.0 ? static_cast<double>(prompt_token_count) / prompt_time : 0.0;
     }
@@ -180,6 +185,14 @@ struct GenerateCompletionInfo {
     double tokens_per_second() const {
         return generation_time > 0.0
             ? static_cast<double>(generation_token_count) / generation_time : 0.0;
+    }
+
+    // MTP acceptance rate: accepted / proposed draft tokens.
+    // Returns 0.0 when no MTP drafts were proposed.
+    double acceptance_rate() const {
+        return mtp_draft_tokens_proposed > 0
+            ? static_cast<double>(mtp_draft_tokens_accepted) / mtp_draft_tokens_proposed
+            : 0.0;
     }
 
     std::string summary() const;
@@ -334,6 +347,11 @@ private:
     std::vector<KVCache> mtp_caches_;  // Per-layer KV cache for MTP head
     std::vector<int> draft_buffer_;    // Speculative draft tokens ready to emit
     int draft_buffer_idx_ = 0;
+
+    // MTP counters for metrics tracking.
+    int mtp_draft_proposed_ = 0;
+    int mtp_draft_accepted_ = 0;
+    int mtp_speculative_steps_ = 0;
 
     // Adaptive draft length: 8-bit accept-history ring buffer.
     std::vector<uint8_t> accept_history_;

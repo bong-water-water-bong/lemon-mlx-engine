@@ -6,6 +6,7 @@
 #include <mlx/mlx.h>
 #include <algorithm>
 #include <chrono>
+#include <iomanip>
 #include <numeric>
 #include <sstream>
 #include <iostream>
@@ -226,6 +227,16 @@ std::string GenerateCompletionInfo::summary() const {
         << "Generation: " << generation_token_count << " tokens, "
         << tokens_per_second() << " tokens/s, "
         << generation_time << "s";
+
+    // Append MTP speculative decoding metrics when available.
+    if (acceptance_rate() > 0.0) {
+        oss << "\nMTP:        drafts=" << mtp_draft_tokens_proposed
+            << " accepted=" << mtp_draft_tokens_accepted
+            << " speculative_steps=" << mtp_speculative_steps
+            << " acceptance_rate=" << std::fixed << std::setprecision(2)
+            << (acceptance_rate() * 100.0) << "%";
+    }
+
     return oss.str();
 }
 
@@ -612,6 +623,11 @@ std::vector<int> TokenIterator::mtp_speculative_step() {
     // Record acceptance for adaptive draft length.
     record_acceptance(n_draft, accepted);
 
+    // Update MTP metrics counters.
+    mtp_speculative_steps_++;
+    mtp_draft_proposed_ += n_draft;
+    mtp_draft_accepted_ += accepted;
+
     // Return first accepted token; remaining accepted drafts are buffered.
     draft_buffer_.clear();
     for (size_t i = 1; i < draft_tokens.size() && static_cast<int>(i) <= accepted; ++i) {
@@ -693,7 +709,10 @@ GenerateCompletionInfo TokenIterator::completion_info(int prompt_token_count) co
         prompt_token_count,
         token_count_,
         prompt_prefill_time_,
-        gen_time
+        gen_time,
+        mtp_draft_proposed_,
+        mtp_draft_accepted_,
+        mtp_speculative_steps_
     };
 }
 
@@ -752,15 +771,16 @@ GenerateCompletionInfo generate(
     // Synchronize the generation stream to ensure all pending GPU work completes.
     mx::synchronize(generation_stream());
 
+    // Use the iterator's completion_info to get accurate MTP metrics.
+    auto info = iter.completion_info(prompt_token_count);
+
+    // Override timing with our measured values (iter's clock starts after prefill).
     auto now = std::chrono::steady_clock::now();
     double gen_time = std::chrono::duration<double>(now - start).count();
+    info.generation_time = gen_time;
+    info.prompt_time += iter.prompt_prefill_time();
 
-    return GenerateCompletionInfo{
-        prompt_token_count,
-        token_count,
-        prompt_time + iter.prompt_prefill_time(),
-        gen_time
-    };
+    return info;
 }
 
 // ---------------------------------------------------------------------------
