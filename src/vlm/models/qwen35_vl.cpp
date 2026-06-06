@@ -702,12 +702,7 @@ std::pair<mx::array, mx::array> Qwen35VLLanguageModel::get_rope_index(
     std::vector<int> mrope_position_deltas;
 
     // Get mask (default to ones)
-    mx::array mask_arr;
-    if (attention_mask) {
-        mask_arr = *attention_mask;
-    } else {
-        mask_arr = mx::ones({batch_size, seq_length}, mx::int32);
-    }
+    mx::array mask_arr = attention_mask ? *attention_mask : mx::ones({batch_size, seq_length}, mx::int32);
 
     // Process each batch item
     for (int bi = 0; bi < batch_size; ++bi) {
