@@ -773,6 +773,86 @@ void Qwen35MoEModel::load_weights(const std::unordered_map<std::string, mx::arra
         auto it = weights.find(name);
         if (it != weights.end()) *target = it->second;
     }
+    // Wire MTPHead if we have MTP weights.
+    if (!mtp_weights_.empty() && !mtp_head_.has_value()) {
+        build_mtp_head();
+    }
+}
+
+void Qwen35MoEModel::build_mtp_head() {
+    MTPHeadConfig cfg;
+
+    // Infer MTP head config entirely from the actual checkpoint weight shapes.
+    // The MTP delta model has different architectural parameters than the base
+    // model (e.g., hidden_size 2560 vs 4096, head_dim 64 vs 128). Deriving
+    // any field from the base model config creates shape mismatches that cause
+    // reshape errors during inference.
+    for (const auto& [key, weight] : mtp_weights_) {
+        if (key.find("mlp.gate_proj.weight") != std::string::npos ||
+            key.find("mlp.up_proj.weight") != std::string::npos) {
+            // gate_proj/up_proj: [intermediate_size, hidden_size]
+            if (weight.ndim() >= 1) {
+                cfg.intermediate_size = weight.shape(0);
+                cfg.hidden_size = weight.shape(1);
+            }
+        } else if (key.find("self_attn.o_proj.weight") != std::string::npos) {
+            // o_proj: [hidden_size, num_attention_heads * head_dim]
+            // The second dimension gives us num_attention_heads * head_dim.
+            if (weight.ndim() >= 2) {
+                cfg.hidden_size = weight.shape(0);
+                int attn_dim = weight.shape(1);
+                // head_dim must divide hidden_size evenly. Try common values.
+                // For Qwen3.5-4B-MTP: hidden=2560, attn_dim=2048 → head_dim=64, num_heads=32
+                for (int try_hd : {64, 80, 96, 128, 160}) {
+                    if (cfg.hidden_size % try_hd == 0 && attn_dim % try_hd == 0) {
+                        cfg.head_dim = try_hd;
+                        cfg.num_attention_heads = attn_dim / try_hd;
+                        break;
+                    }
+                }
+            }
+        } else if (key.find("self_attn.k_proj.weight") != std::string::npos) {
+            // k_proj: [num_kv_heads * head_dim, hidden_size]
+            if (weight.ndim() >= 2 && cfg.head_dim > 0) {
+                cfg.num_key_value_heads = weight.shape(0) / cfg.head_dim;
+            }
+        } else if (key.find("self_attn.q_proj.weight") != std::string::npos) {
+            // q_proj: [num_attention_heads * head_dim * 2, hidden_size]
+            // (* 2 for fused Q+gate projection in MTP head)
+            // Use as cross-check: q_proj_dim should equal num_heads * head_dim * 2.
+            if (weight.ndim() >= 1 && cfg.head_dim > 0) {
+                int q_proj_dim = weight.shape(0);
+                int inferred_heads = q_proj_dim / (cfg.head_dim * 2);
+                if (inferred_heads > 0) {
+                    cfg.num_attention_heads = inferred_heads;
+                }
+            }
+        }
+    }
+
+    // Fallback: if weight inference didn't find values, use base model config.
+    if (cfg.hidden_size == 0) cfg.hidden_size = config_.hidden_size;
+    if (cfg.intermediate_size == 0) cfg.intermediate_size = config_.intermediate_size;
+    if (cfg.num_attention_heads == 0) cfg.num_attention_heads = config_.num_attention_heads;
+    if (cfg.num_key_value_heads == 0) cfg.num_key_value_heads = config_.num_key_value_heads;
+    if (cfg.head_dim == 0) cfg.head_dim = config_.resolved_head_dim();
+    cfg.rms_norm_eps = config_.rms_norm_eps;
+    cfg.rope_theta = config_.rope_theta;
+    cfg.partial_rotary_factor = config_.partial_rotary_factor;
+
+    // MTP head always uses dense SwiGLU MLP (gate_proj/up_proj/down_proj).
+    // Checkpoint does NOT contain MoE routing weights for the MTP head
+    // (no mtp.layers.0.mlp.gate.weight, no shared_expert).
+    mtp_head_ = MTPHead(cfg);
+    mtp_head_->load_mtp_weights(mtp_weights_);
+}
+
+std::vector<KVCache> Qwen35MoEModel::new_mtp_cache(const GenerateParameters& params) const {
+    // MTP head has one decoder layer with standard attention.
+    std::vector<KVCache> caches;
+    caches.reserve(1);
+    caches.emplace_back(KVCacheSimple{});
+    return caches;
 }
 
 std::unordered_map<std::string, mx::array*> Qwen35MoEModel::weight_map() {
