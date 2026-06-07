@@ -881,43 +881,57 @@ void Qwen35MoEModel::load_weights(const std::unordered_map<std::string, mx::arra
 
 void Qwen35MoEModel::build_mtp_head() {
     MTPHeadConfig cfg;
-    cfg.hidden_size = config_.hidden_size;
 
-    // Infer MTP head config from the actual checkpoint weight shapes.
+    // Infer MTP head config entirely from the actual checkpoint weight shapes.
     // The MTP delta model has different architectural parameters than the base
-    // model (e.g., intermediate_size 9216 vs 14336, num_kv_heads 4 vs 8,
-    // rope_theta 10000000 vs 100000). Using base model values creates
-    // zero-initialized weights that produce degenerate output.
+    // model (e.g., hidden_size 2560 vs 4096, head_dim 64 vs 128). Deriving
+    // any field from the base model config creates shape mismatches that cause
+    // reshape errors during inference.
     for (const auto& [key, weight] : mtp_weights_) {
         if (key.find("mlp.gate_proj.weight") != std::string::npos ||
             key.find("mlp.up_proj.weight") != std::string::npos) {
             // gate_proj/up_proj: [intermediate_size, hidden_size]
             if (weight.ndim() >= 1) {
                 cfg.intermediate_size = weight.shape(0);
+                cfg.hidden_size = weight.shape(1);
             }
-        } else if (key.find("self_attn.q_proj.weight") != std::string::npos) {
-            // q_proj: [num_attention_heads * head_dim * 2, hidden_size]
-            // (* 2 for fused Q+gate projection in MTP head)
-            if (weight.ndim() >= 1) {
-                int q_proj_dim = weight.shape(0);
-                int hd = config_.resolved_head_dim();
-                if (hd > 0) {
-                    cfg.num_attention_heads = q_proj_dim / (hd * 2);
+        } else if (key.find("self_attn.o_proj.weight") != std::string::npos) {
+            // o_proj: [hidden_size, num_attention_heads * head_dim]
+            // The second dimension gives us num_attention_heads * head_dim.
+            if (weight.ndim() >= 2) {
+                cfg.hidden_size = weight.shape(0);
+                int attn_dim = weight.shape(1);
+                // head_dim must divide hidden_size evenly. Try common values.
+                // For Qwen3.5-4B-MTP: hidden=2560, attn_dim=2048 → head_dim=64, num_heads=32
+                for (int try_hd : {64, 80, 96, 128, 160}) {
+                    if (cfg.hidden_size % try_hd == 0 && attn_dim % try_hd == 0) {
+                        cfg.head_dim = try_hd;
+                        cfg.num_attention_heads = attn_dim / try_hd;
+                        break;
+                    }
                 }
             }
         } else if (key.find("self_attn.k_proj.weight") != std::string::npos) {
             // k_proj: [num_kv_heads * head_dim, hidden_size]
-            if (weight.ndim() >= 1) {
-                int kv_proj_dim = weight.shape(0);
-                int hd = config_.resolved_head_dim();
-                if (hd > 0) {
-                    cfg.num_key_value_heads = kv_proj_dim / hd;
+            if (weight.ndim() >= 2 && cfg.head_dim > 0) {
+                cfg.num_key_value_heads = weight.shape(0) / cfg.head_dim;
+            }
+        } else if (key.find("self_attn.q_proj.weight") != std::string::npos) {
+            // q_proj: [num_attention_heads * head_dim * 2, hidden_size]
+            // (* 2 for fused Q+gate projection in MTP head)
+            // Use as cross-check: q_proj_dim should equal num_heads * head_dim * 2.
+            if (weight.ndim() >= 1 && cfg.head_dim > 0) {
+                int q_proj_dim = weight.shape(0);
+                int inferred_heads = q_proj_dim / (cfg.head_dim * 2);
+                if (inferred_heads > 0) {
+                    cfg.num_attention_heads = inferred_heads;
                 }
             }
         }
     }
 
     // Fallback: if weight inference didn't find values, use base model config.
+    if (cfg.hidden_size == 0) cfg.hidden_size = config_.hidden_size;
     if (cfg.intermediate_size == 0) cfg.intermediate_size = config_.intermediate_size;
     if (cfg.num_attention_heads == 0) cfg.num_attention_heads = config_.num_attention_heads;
     if (cfg.num_key_value_heads == 0) cfg.num_key_value_heads = config_.num_key_value_heads;
