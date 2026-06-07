@@ -181,60 +181,80 @@ void MTPHead::load_mtp_weights(
     const std::unordered_map<std::string, mx::array>& mtp_weights) {
     auto wmap = weight_map();
 
-    // First pass: dequantize quantized weights (.weight with matching .scales).
-    // Build a map of prefix -> dequantized weight.
-    std::unordered_map<std::string, mx::array> dequantized;
+    // Collect quantized weight prefixes (those with .scales + .weight).
     const std::string scales_suffix = ".scales";
     const std::string biases_suffix = ".biases";
+    const std::string weight_suffix = ".weight";
 
+    std::vector<std::string> quant_prefixes;
     for (const auto& [raw_key, value] : mtp_weights) {
-        // Check if this is a scales key
         if (raw_key.size() > scales_suffix.size() &&
             raw_key.compare(raw_key.size() - scales_suffix.size(), scales_suffix.size(), scales_suffix) == 0) {
             std::string prefix = raw_key.substr(0, raw_key.size() - scales_suffix.size());
             std::string weight_key = prefix + ".weight";
-            std::string biases_key = prefix + ".biases";
-
-            auto wit = mtp_weights.find(weight_key);
-            if (wit == mtp_weights.end()) continue;
-
-            const auto& packed = wit->second;
-            const auto& scales = value;
-            std::optional<mx::array> biases;
-            auto bit = mtp_weights.find(biases_key);
-            if (bit != mtp_weights.end()) {
-                biases = bit->second;
+            if (mtp_weights.count(weight_key)) {
+                quant_prefixes.push_back(prefix);
             }
-
-            auto deq = mx::dequantize(packed, scales, biases, args_.quant_group_size, args_.quant_bits);
-            dequantized[weight_key] = std::move(deq);
         }
     }
 
-    // Second pass: load weights, preferring dequantized versions where available.
+    // Dequantize and load quantized weights first.
+    for (const auto& prefix : quant_prefixes) {
+        std::string weight_key = prefix + ".weight";
+        std::string scales_key = prefix + ".scales";
+        std::string biases_key = prefix + ".biases";
+
+        const auto& packed = mtp_weights.at(weight_key);
+        const auto& scales = mtp_weights.at(scales_key);
+        std::optional<mx::array> biases;
+        auto bit = mtp_weights.find(biases_key);
+        if (bit != mtp_weights.end()) {
+            biases = bit->second;
+        }
+
+        auto deq = mx::dequantize(packed, scales, biases, args_.quant_group_size, args_.quant_bits);
+
+        // Map to weight_map key (strip mtp. prefix if present)
+        std::string lookup_key = weight_key;
+        auto pos = lookup_key.find("mtp.");
+        if (pos != std::string::npos) {
+            lookup_key = lookup_key.substr(pos + 4);
+        }
+
+        auto it = wmap.find(lookup_key);
+        if (it != wmap.end()) {
+            *it->second = std::move(deq);
+        }
+    }
+
+    // Load non-quantized weights (skip scales/biases entries).
     for (const auto& [raw_key, value] : mtp_weights) {
-        // Skip scales and biases entries
+        // Skip scales and biases — already processed
         if (raw_key.size() > scales_suffix.size() &&
             (raw_key.compare(raw_key.size() - scales_suffix.size(), scales_suffix.size(), scales_suffix) == 0 ||
              raw_key.compare(raw_key.size() - biases_suffix.size(), biases_suffix.size(), biases_suffix) == 0)) {
             continue;
         }
+        // Skip quantized weights — already dequantized above
+        bool is_quantized_weight = false;
+        if (raw_key.size() > weight_suffix.size() &&
+            raw_key.compare(raw_key.size() - weight_suffix.size(), weight_suffix.size(), weight_suffix) == 0) {
+            std::string prefix = raw_key.substr(0, raw_key.size() - weight_suffix.size());
+            std::string sk = prefix + ".scales";
+            if (mtp_weights.count(sk)) {
+                is_quantized_weight = true;
+            }
+        }
+        if (is_quantized_weight) continue;
 
         std::string key = raw_key;
         auto pos = key.find("mtp.");
         if (pos != std::string::npos) {
             key = key.substr(pos + 4);
         }
-
         auto it = wmap.find(key);
         if (it != wmap.end()) {
-            // Check if we have a dequantized version
-            auto dit = dequantized.find(raw_key);
-            if (dit != dequantized.end()) {
-                *it->second = dit->second;
-            } else {
-                *it->second = value;
-            }
+            *it->second = value;
         }
     }
 
