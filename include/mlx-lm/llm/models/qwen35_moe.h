@@ -292,7 +292,7 @@ public:
     mlx::core::array embed_as_linear(const mlx::core::array& x) const {
         auto tokens = x;
         if (tokens.ndim() < 2) {
-            tokens = mx::reshape(tokens, {1, static_cast<int>(tokens.size())});
+            tokens = mlx::core::reshape(tokens, {1, static_cast<int>(tokens.size())});
         }
         return model_.embed_tokens(tokens);
     }
