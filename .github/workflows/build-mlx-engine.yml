@@ -554,35 +554,6 @@ jobs:
             print('  (no server.log found)', file=sys.stderr)
             content = ''
 
-        # Extract MTP diagnostic line (supports both old and new format).
-        mtp_diag = {}
-        # New format: get_mtp_head_fn=bound get_mtp_head()=non-null embed_fn=... apply_lm_head_fn=... model_id=...
-        diag_m = re.search(r'\[MTP_DIAG\]\s+defaults\.use_mtp=(\S+)\s+chat_req\.use_mtp=(\S+)\s+params\.use_mtp=(\S+)\s+get_mtp_head_fn=(\S+)\s+get_mtp_head\(\)=(\S+)\s+embed_fn=(\S+)\s+apply_lm_head_fn=(\S+)\s+model_id=(\S+)', content)
-        if diag_m:
-            mtp_diag = {
-                'mtp_default': diag_m.group(1),
-                'request_use_mtp': diag_m.group(2),
-                'params_use_mtp': diag_m.group(3),
-                'get_mtp_head_fn': diag_m.group(4),
-                'get_mtp_head': diag_m.group(5),
-                'embed_fn': diag_m.group(6),
-                'apply_lm_head_fn': diag_m.group(7),
-                'model_id': diag_m.group(8),
-            }
-            print(f\"  [MTP_DIAG] use_mtp={mtp_diag['params_use_mtp']} get_mtp_head_fn={mtp_diag['get_mtp_head_fn']} get_mtp_head()={mtp_diag['get_mtp_head']} embed_fn={mtp_diag['embed_fn']} apply_lm_head_fn={mtp_diag['apply_lm_head_fn']}\", file=sys.stderr)
-        else:
-            # Old format fallback: model.get_mtp_head_fn=...
-            diag_m = re.search(r'\[MTP_DIAG\]\s+defaults\.use_mtp=(\S+)\s+chat_req\.use_mtp=(\S+)\s+params\.use_mtp=(\S+)\s+model\.get_mtp_head_fn=(\S+)\s+model_id=(\S+)', content)
-            if diag_m:
-                mtp_diag = {
-                    'mtp_default': diag_m.group(1),
-                    'request_use_mtp': diag_m.group(2),
-                    'params_use_mtp': diag_m.group(3),
-                    'get_mtp_head_fn': diag_m.group(4),
-                    'model_id': diag_m.group(5),
-                }
-                print(f\"  [MTP_DIAG] use_mtp={mtp_diag['params_use_mtp']} get_mtp_head_fn={mtp_diag['get_mtp_head_fn']}\", file=sys.stderr)
-
         results = []
         # Split on [TPS] markers to get each generation block
         tps_blocks = re.split(r'(?=\[TPS\])', content)
@@ -618,9 +589,6 @@ jobs:
                     entry['mtp_draft_tokens_accepted'] = int(mtp_m.group(2))
                     entry['mtp_speculative_steps'] = int(mtp_m.group(3))
                     entry['mtp_acceptance_rate_pct'] = float(mtp_m.group(4))
-                if mtp_diag:
-                    entry['mtp_diagnostic'] = mtp_diag
-
                 results.append(entry)
 
         if results:
@@ -632,24 +600,6 @@ jobs:
             print(f\"  {'-'*14:<16} {'-'*10:>12} {'-'*8:>10} {'-'*6:>8} {'-'*4:>6}\")
             for r in results:
                 mtp_status = 'YES' if r.get('mtp_enabled') else 'no'
-                diag = r.get('mtp_diagnostic')
-                if diag:
-                    gfn = diag.get('get_mtp_head_fn', '')
-                    gfh = diag.get('get_mtp_head', '')
-                    emb = diag.get('embed_fn', '')
-                    lmh = diag.get('apply_lm_head_fn', '')
-                    # If MTP not enabled, show which condition failed
-                    if not r.get('mtp_enabled'):
-                        if gfn == 'NULL':
-                            mtp_status = 'no(SFINAE)'
-                        elif gfn and gfn != 'non-null':
-                            mtp_status = 'no(head=NULL)'
-                        elif emb == 'NULL':
-                            mtp_status = 'no(embed=NULL)'
-                        elif lmh == 'NULL':
-                            mtp_status = 'no(lm_head=NULL)'
-                        elif gfh == 'NULL':
-                            mtp_status = 'no(head=NULL)'
                 print(f\"  {r['platform']:<16} {r['prompt_tps']:>12.2f} {r['generation_tps']:>10.2f} {r['generation_tokens']:>8} {mtp_status:>6}\")
         else:
             # Write empty result so artifact still uploads
