@@ -882,10 +882,36 @@ void Qwen35MoEModel::load_weights(const std::unordered_map<std::string, mx::arra
 void Qwen35MoEModel::build_mtp_head() {
     MTPHeadConfig cfg;
     cfg.hidden_size = config_.hidden_size;
-    cfg.intermediate_size = config_.intermediate_size;
-    cfg.num_attention_heads = config_.num_attention_heads;
-    cfg.num_key_value_heads = config_.num_key_value_heads;
-    cfg.head_dim = config_.resolved_head_dim();
+
+    // Infer MTP head config from the actual checkpoint weight shapes.
+    // The MTP delta model has different architectural parameters than the base
+    // model (e.g., intermediate_size 9216 vs 14336, num_kv_heads 4 vs 8,
+    // rope_theta 10000000 vs 100000). Using base model values creates
+    // zero-initialized weights that produce degenerate output.
+    for (const auto& [key, weight] : mtp_weights_) {
+        if (key.find("mlp.gate_proj.weight") != std::string::npos ||
+            key.find("mlp.up_proj.weight") != std::string::npos) {
+            // gate_proj/up_proj: [intermediate_size, hidden_size]
+            if (weight.ndim() >= 1) {
+                cfg.intermediate_size = weight.shape(0);
+            }
+        } else if (key.find("self_attn.k_proj.weight") != std::string::npos) {
+            // k_proj: [num_kv_heads * head_dim, hidden_size]
+            if (weight.ndim() >= 1) {
+                int kv_proj_dim = weight.shape(0);
+                int hd = config_.resolved_head_dim();
+                if (hd > 0) {
+                    cfg.num_key_value_heads = kv_proj_dim / hd;
+                }
+            }
+        }
+    }
+
+    // Fallback: if weight inference didn't find values, use base model config.
+    if (cfg.intermediate_size == 0) cfg.intermediate_size = config_.intermediate_size;
+    if (cfg.num_attention_heads == 0) cfg.num_attention_heads = config_.num_attention_heads;
+    if (cfg.num_key_value_heads == 0) cfg.num_key_value_heads = config_.num_key_value_heads;
+    if (cfg.head_dim == 0) cfg.head_dim = config_.resolved_head_dim();
     cfg.rms_norm_eps = config_.rms_norm_eps;
     cfg.rope_theta = config_.rope_theta;
     cfg.partial_rotary_factor = config_.partial_rotary_factor;
