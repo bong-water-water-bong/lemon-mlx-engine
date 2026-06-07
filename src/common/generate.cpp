@@ -453,13 +453,16 @@ void TokenIterator::prepare(const LMInput& input, int window_size) {
         y_ = LMInput::Text(token);
         mx::async_eval(y_.tokens);
 
-        // Capture hidden state from prefill for MTP.
+        // Capture state from prefill output (for models that return logits).
         if (prep_output.state.has_value()) {
             state_ = prep_output.state;
         }
     }
 
     // Capture trunk hidden state at last prompt position for first MTP step.
+    // This must happen AFTER step() or convert_to_token() has populated state_.
+    // For the tokens path (llm_default_prepare), step() populates state_.
+    // For the logits path, we captured state from prep_output above.
     if (use_mtp_ && state_.has_value() && state_->hidden_intermediates.has_value()) {
         auto trunk_h = state_->hidden_intermediates.value();  // [B, T, H]
         int last_pos = trunk_h.shape(1) - 1;
