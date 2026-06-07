@@ -287,8 +287,14 @@ public:
     // Note: embed_as_linear is bound as embed_fn by SFINAE, but MTP
     // passes raw token IDs (not embeddings), so we delegate to
     // embed_tokens which does the correct embedding lookup (mx::take).
+    // We also ensure the input is at least 2D so mx::take produces
+    // 3D [B, T, H] output as the MTP head expects.
     mlx::core::array embed_as_linear(const mlx::core::array& x) const {
-        return model_.embed_tokens(x);
+        auto tokens = x;
+        if (tokens.ndim() < 2) {
+            tokens = mx::reshape(tokens, {1, static_cast<int>(tokens.size())});
+        }
+        return model_.embed_tokens(tokens);
     }
     mlx::core::array apply_lm_head(const mlx::core::array& hidden) const {
         return model_.apply_lm_head(hidden);
