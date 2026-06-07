@@ -24,7 +24,8 @@ MTPDecoderLayerMoE::MTPDecoderLayerMoE(const MTPHeadConfig& args, int num_expert
     : args_(args),
       num_experts_(num_experts),
       top_k_(top_k),
-      q_proj_weight_(mx::zeros({args.num_attention_heads * args.resolved_head_dim(), args.hidden_size})),
+      // q_proj outputs 2x head_dim for the sigmoid gate (matches dense MTPDecoderLayer)
+      q_proj_weight_(mx::zeros({args.num_attention_heads * args.resolved_head_dim() * 2, args.hidden_size})),
       k_proj_weight_(mx::zeros({args.num_key_value_heads * args.resolved_head_dim(), args.hidden_size})),
       v_proj_weight_(mx::zeros({args.num_key_value_heads * args.resolved_head_dim(), args.hidden_size})),
       o_proj_weight_(mx::zeros({args.hidden_size, args.num_attention_heads * args.resolved_head_dim()})),
@@ -55,18 +56,21 @@ mx::array MTPDecoderLayerMoE::operator()(
 
     // --- self-attention sub-block (same as dense MTPDecoderLayer) ---
     auto normed = mx::fast::rms_norm(x, input_layernorm_weight_, args_.rms_norm_eps);
-    auto q = linear_no_bias(normed, q_proj_weight_);
+    auto q_proj_out = linear_no_bias(normed, q_proj_weight_);
+    // Reshape to [B, L, num_heads, 2*head_dim] then split into queries + gate
+    auto q_proj_reshaped = mx::reshape(q_proj_out, {B, L, n_heads, -1});
+    auto queries = mx::slice(q_proj_reshaped, {0, 0, 0, 0}, {B, L, n_heads, hd});
+    auto q_gate = mx::slice(q_proj_reshaped, {0, 0, 0, hd}, {B, L, n_heads, 2 * hd});
+
     auto k = linear_no_bias(normed, k_proj_weight_);
     auto v = linear_no_bias(normed, v_proj_weight_);
 
-    auto q4 = mx::reshape(q, {B, L, n_heads, hd});
+    auto q4 = mx::transpose(
+        mx::fast::rms_norm(queries, q_norm_weight_, args_.rms_norm_eps), {0, 2, 1, 3});
     auto k4 = mx::reshape(k, {B, L, n_kv_heads, hd});
-    auto v4 = mx::reshape(v, {B, L, n_kv_heads, hd});
-
-    q4 = mx::transpose(
-        mx::fast::rms_norm(q4, q_norm_weight_, args_.rms_norm_eps), {0, 2, 1, 3});
     k4 = mx::transpose(
         mx::fast::rms_norm(k4, k_norm_weight_, args_.rms_norm_eps), {0, 2, 1, 3});
+    auto v4 = mx::reshape(v, {B, L, n_kv_heads, hd});
     v4 = mx::transpose(v4, {0, 2, 1, 3});
 
     int rope_dims = args_.resolved_rope_dims();
@@ -82,6 +86,10 @@ mx::array MTPDecoderLayerMoE::operator()(
 
     auto attn_out = sdpa(q4, k4, v4, scale, mask);
     attn_out = mx::reshape(mx::transpose(attn_out, {0, 2, 1, 3}), {B, L, n_heads * hd});
+    // Apply sigmoid gate: reshape q_gate [B, L, n_heads, hd] -> [B, L, n_heads * hd]
+    // to match attention output shape, matching dense MTPDecoderLayer.
+    auto gate_sigmoid = mx::sigmoid(mx::reshape(q_gate, {B, L, -1}));
+    attn_out = mx::multiply(attn_out, gate_sigmoid);
     attn_out = linear_no_bias(attn_out, o_proj_weight_);
 
     auto h = mx::add(x, attn_out);

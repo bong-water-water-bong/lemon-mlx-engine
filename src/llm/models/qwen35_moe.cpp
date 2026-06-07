@@ -890,16 +890,10 @@ void Qwen35MoEModel::build_mtp_head() {
     cfg.rope_theta = config_.rope_theta;
     cfg.partial_rotary_factor = config_.partial_rotary_factor;
 
-    // MoE MTP head: use MoE decoder layer when trunk has experts.
-    cfg.num_experts = config_.num_experts;
-    cfg.num_experts_per_tok = config_.num_experts_per_tok;
-    cfg.shared_expert_intermediate_size = config_.shared_expert_intermediate_size;
-
-    if (cfg.is_moe()) {
-        mtp_head_ = MTPHead::create_moe(cfg);
-    } else {
-        mtp_head_ = MTPHead(cfg);
-    }
+    // MTP head always uses dense SwiGLU MLP (gate_proj/up_proj/down_proj).
+    // Checkpoint does NOT contain MoE routing weights for the MTP head
+    // (no mtp.layers.0.mlp.gate.weight, no shared_expert).
+    mtp_head_ = MTPHead(cfg);
     mtp_head_->load_mtp_weights(mtp_weights_);
 }
 
