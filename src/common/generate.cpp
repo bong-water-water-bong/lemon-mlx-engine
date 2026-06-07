@@ -600,6 +600,28 @@ std::vector<int> TokenIterator::mtp_speculative_step() {
     auto draft_arr = mx::array(draft_seq.data(), {1, static_cast<int>(draft_seq.size())}, mx::int32);
     LMInput::Text draft_text(draft_arr);
 
+    // Save MambaCache state before trunk verification.
+    // MambaCache can't be trimmed like KVCacheSimple — its recurrent state
+    // includes info from all tokens processed. If drafts are rejected, we need
+    // to restore MambaCache to the pre-verification position and re-run on
+    // accepted tokens to keep it in sync with the attention KV cache.
+    struct SavedMambaState {
+        MambaCache::Snapshot snapshot;
+        bool has_mamba = false;
+    };
+    std::vector<SavedMambaState> saved_mamba;
+    saved_mamba.reserve(cache_.size());
+    for (auto& c : cache_) {
+        if (auto* m = c.as_mamba()) {
+            SavedMambaState s;
+            s.snapshot = m->snapshot();
+            s.has_mamba = true;
+            saved_mamba.push_back(s);
+        } else {
+            saved_mamba.push_back({});
+        }
+    }
+
     // Run trunk model forward on all draft tokens.
     // Request hidden intermediates so state_ is properly updated.
     auto state = LMOutput::State(std::nullopt, std::optional<mx::array>(mx::array(0.0f)));
@@ -641,11 +663,43 @@ std::vector<int> TokenIterator::mtp_speculative_step() {
         y_ = LMInput::Text(mx::array({last_token}, {1}, mx::int32));
     }
 
-    // Roll back KV cache if not all drafts were accepted.
+    // Roll back caches if not all drafts were accepted.
+    // For KVCacheSimple: set_position trims KV arrays to the accepted count.
+    // For MambaCache: set_position is a no-op — we restore from snapshot and re-run.
     if (accepted < n_draft && !cache_.empty()) {
         size_t new_pos = static_cast<size_t>(trunk_cache_pos + accepted);
+
+        // Restore MambaCache to pre-verification state.
+        for (size_t i = 0; i < cache_.size(); ++i) {
+            if (saved_mamba[i].has_mamba) {
+                auto* m = cache_[i].as_mamba();
+                if (m) m->restore(saved_mamba[i].snapshot);
+            }
+        }
+
+        // Roll back all caches to pre-verification position, then re-run
+        // forward pass on accepted tokens only. This keeps Mamba and KV
+        // caches in sync: both advance from trunk_cache_pos by accepted count.
         for (auto& c : cache_) {
-            c.set_position(new_pos);
+            c.set_position(trunk_cache_pos);
+        }
+
+        // Re-run trunk on accepted tokens. Use accepted draft tokens (which
+        // match trunk argmax at accepted positions).
+        if (accepted > 0) {
+            std::vector<int32_t> accepted_seq;
+            accepted_seq.reserve(accepted);
+            for (int i = 0; i < accepted; ++i) {
+                accepted_seq.push_back(static_cast<int32_t>(draft_tokens[i]));
+            }
+            auto accepted_arr = mx::array(accepted_seq.data(), {1, static_cast<int>(accepted_seq.size())}, mx::int32);
+            LMInput::Text accepted_text(accepted_arr);
+
+            auto rerun_state = LMOutput::State(std::nullopt, std::optional<mx::array>(mx::array(0.0f)));
+            result = context_.call_fn(accepted_text, &cache_, &rerun_state);
+            state_ = result.state;
+            maybe_quantize_kv_cache(cache_, kv_bits_, kv_group_size_, quantized_kv_start_);
+            logits = result.logits;  // [1, accepted, vocab]
         }
     }
 

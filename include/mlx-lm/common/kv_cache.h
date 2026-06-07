@@ -163,6 +163,12 @@ class MambaCache {
     int offset_ = 0;
 
 public:
+    // Snapshot of MambaCache state for speculative decoding rollback.
+    struct Snapshot {
+        std::optional<mlx::core::array> states[2];
+        int offset = 0;
+    };
+
     MambaCache() = default;
 
     int offset() const { return offset_; }
@@ -184,8 +190,26 @@ public:
 
     std::vector<mlx::core::array> state() const { return {}; }
 
-    // Partial-rollback API: MambaCache does not support token-level rollback.
-    // get_position returns current offset; set_position is a no-op.
+    // Snapshot/restore for MTP speculative decoding.
+    // Save current state before trunk verification. If drafts are rejected,
+    // restore and re-run on accepted tokens to keep Mamba and KV caches in sync.
+    Snapshot snapshot() const {
+        Snapshot s;
+        s.states[0] = states_[0];
+        s.states[1] = states_[1];
+        s.offset = offset_;
+        return s;
+    }
+
+    void restore(const Snapshot& s) {
+        states_[0] = s.states[0];
+        states_[1] = s.states[1];
+        offset_ = s.offset;
+    }
+
+    // Partial-rollback API: MambaCache does not support token-level rollback
+    // via set_position (recurrent state cannot be trimmed). Use snapshot/restore
+    // instead for speculative decoding.
     size_t get_position() const { return static_cast<size_t>(offset_); }
     void set_position(size_t /*pos*/) { /* no-op: recurrent state cannot be rolled back */ }
 };
