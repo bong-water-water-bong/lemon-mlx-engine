@@ -316,9 +316,9 @@ jobs:
             use_mtp: true
             no_think: true
             timeout_minutes: 30
-            # KNOWN ISSUE: ROCm 4-bit quantized model inference fails with reshape
-            # error due to upstream MLX ROCm kernel bug. Server starts OK but crashes
-            # on first forward pass. Tracking upstream for fix.
+            # Safety net: keep allow_failure until patch removal is verified on CI.
+            # PR #10 (MLX commit 45f6ee1) fixed the root cause upstream.
+            # Our local patch (rocm-skip-dequant-gemm-uint32.patch) has been deleted.
             allow_failure: true
           - os: ubuntu-cpu
             artifact: mlx-engine-ubuntu-cpu-x64
@@ -445,13 +445,9 @@ jobs:
         fi
 
         echo "Starting server on port $PORT (MTP=${MTP_FLAG:+ON:-OFF})..."
-        # NOTE: ROCm smoke test inference failures with 4-bit quantized models
-        # are caused by an upstream MLX ROCm quantized matmul kernel bug.
-        # The Qwen3.5-4B-MTP-4bit model (24 GDN + 8 full_attention layers) fails
-        # with: "[reshape] Cannot reshape array of size 4096 into shape (1,2560,32,128)"
-        # This is a ROCm backend issue, not an MTP implementation bug.
-        # No env var workaround exists in the MLX codebase.
-        # Tracking upstream for a fix. The ROCm MTP test is marked allow_failure:true.
+        # PR #10 (MLX commit 45f6ee1) fixed affine_dequantize_packed_kernel #pragma unroll
+        # miscompile on RDNA 3.5. Our local patch was removed — dequant+GEMM path now works
+        # correctly for uint32 packed weights on ROCm.
         mlx-binaries/server --port $PORT $MTP_FLAG $NO_THINK_FLAG > server.log 2>&1 &
         SERVER_PID=$!
 
@@ -469,7 +465,7 @@ jobs:
         done
 
         if [ "$READY" != "true" ]; then
-          echo "Server failed to start within 60s. Last HTTP code: $http_code"
+          echo "Server failed to start within ${READY_TIMEOUT}s. Last HTTP code: $http_code"
           echo "=== Server Log ==="
           cat server.log || true
           exit 1
