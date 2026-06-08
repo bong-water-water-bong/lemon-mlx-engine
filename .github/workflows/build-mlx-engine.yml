@@ -110,6 +110,9 @@ jobs:
         # Pin clang (ROCm 7.13 = clang 23) to GCC 13's libstdc++.
         GCC_INSTALL_DIR="/usr/lib/gcc/x86_64-linux-gnu/13"
 
+        # Clear FetchContent cache to force fresh MLX source checkout
+        rm -rf build/_deps/
+
         mkdir -p build && cd build
 
         cmake .. -G Ninja \
