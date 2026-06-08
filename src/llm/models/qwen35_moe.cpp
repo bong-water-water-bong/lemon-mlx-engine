@@ -943,7 +943,7 @@ void Qwen35MoEModel::build_mtp_head() {
         }
 
         auto deq = mx::dequantize(packed, scales, biases, cfg.quant_group_size, cfg.quant_bits);
-        dequantized_weights[weight_key] = std::move(deq);
+        dequantized_weights.insert_or_assign(weight_key, std::move(deq));
     }
 
     // Copy non-quantized weights (skip scales/biases and already-dequantized).
@@ -960,7 +960,7 @@ void Qwen35MoEModel::build_mtp_head() {
             is_quantized = mtp_weights_.count(prefix + std::string(kScalesSuffix)) > 0;
         }
         if (!is_quantized) {
-            dequantized_weights[key] = weight;
+            dequantized_weights.insert_or_assign(key, weight);
         }
     }
 
