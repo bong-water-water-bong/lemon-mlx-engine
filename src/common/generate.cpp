@@ -601,14 +601,13 @@ std::vector<int> TokenIterator::mtp_speculative_step() {
     }
 
     // Build draft token sequence for trunk verification.
-    // Prepend y_ so the trunk re-processes it at its actual position.
-    // In causal LM, token at position k produces a logit predicting position k+1.
-    // Without y_: trunk processes d0 at pos P → logit predicts d1, not d0 (OFF BY ONE).
-    // With y_: trunk processes y_ at pos P-1 → logit correctly predicts d0.
-    int32_t original_y = y_.tokens.item<int32_t>();
+    // Feed [d0, d1, d2] at cache position P (where P = N+K after prepare).
+    // The trunk processes d0 at position P, producing logit at P that predicts P+1.
+    // So logit[0] predicts d1, logit[1] predicts d2, etc.
+    // We compare logit[i] vs draft[i+1] to verify the drafts.
+    // Note: d0 is not verified — it's trusted from the MTP head.
     std::vector<int32_t> draft_seq;
-    draft_seq.reserve(1 + draft_tokens.size());
-    draft_seq.push_back(original_y);
+    draft_seq.reserve(draft_tokens.size());
     for (int t : draft_tokens) draft_seq.push_back(static_cast<int32_t>(t));
     auto draft_arr = mx::array(draft_seq.data(), {1, static_cast<int>(draft_seq.size())}, mx::int32);
     LMInput::Text draft_text(draft_arr);
@@ -643,44 +642,48 @@ std::vector<int> TokenIterator::mtp_speculative_step() {
     maybe_quantize_kv_cache(cache_, kv_bits_, kv_group_size_, quantized_kv_start_);
 
     // Compare trunk argmax vs draft tokens.
-    // logits shape: [1, n_draft+1, vocab] (the +1 is from the prepended y_).
-    // logits[0, i, :] is the trunk's prediction at position i, which predicts
-    // the token at position i+1 in the sequence. Since we prepended y_ at
-    // position 0, logits[0, 0, :] predicts d0, logits[0, 1, :] predicts d1, etc.
+    // logits shape: [1, n_draft, vocab].
+    // logits[0, i, :] is the trunk's prediction after processing draft[i].
+    // Since draft[i] is at position P+i, logits[0, i, :] predicts position P+i+1.
+    // So we compare logit[i] vs draft[i+1] (not draft[i]).
+    // Note: draft[0] is not verified — it's trusted from the MTP head.
     auto logits = result.logits;
     int accepted = 0;
 
-    for (int i = 0; i < n_draft; ++i) {
+    for (int i = 0; i < n_draft - 1; ++i) {
         auto logit_i = mx::slice(logits, {0, i, 0}, {1, i + 1, static_cast<int>(logits.shape(2))});
         logit_i = mx::squeeze(logit_i, 1);
         auto trunk_token = mx::argmax(logit_i, -1).item<int32_t>();
 
-        if (trunk_token == draft_tokens[i]) {
+        if (trunk_token == draft_tokens[i + 1]) {
             accepted++;
         } else {
             // Mismatch — use trunk token instead, stop accepting.
-            draft_tokens[i] = trunk_token;
+            // draft_tokens[i+1] is replaced with trunk's prediction.
+            draft_tokens[i + 1] = trunk_token;
             break;
         }
     }
 
     // Set y_ to the last token to emit.
-    if (accepted == n_draft) {
-        // All drafts accepted — get bonus token from the trunk's last logit.
-        auto bonus_logit = mx::slice(logits, {0, n_draft, 0}, {1, n_draft + 1, static_cast<int>(logits.shape(2))});
+    // accepted is the number of drafts verified (excluding d0).
+    // Total emitted = 1 (d0) + accepted (verified d1...d_{accepted}).
+    if (accepted == n_draft - 1) {
+        // All verifiable drafts accepted — get bonus token from the trunk's last logit.
+        auto bonus_logit = mx::slice(logits, {0, n_draft - 1, 0}, {1, n_draft, static_cast<int>(logits.shape(2))});
         bonus_logit = mx::squeeze(bonus_logit, 1);
         int bonus_token = mx::argmax(bonus_logit, -1).item<int32_t>();
         y_ = LMInput::Text(mx::array({bonus_token}, {1}, mx::int32));
     } else {
-        // Mismatch at position `accepted`. draft_tokens[accepted] was already
+        // Mismatch at position `accepted+1`. draft_tokens[accepted+1] was already
         // replaced with the trunk's token above.
-        y_ = LMInput::Text(mx::array({draft_tokens[accepted]}, {1}, mx::int32));
+        y_ = LMInput::Text(mx::array({draft_tokens[accepted + 1]}, {1}, mx::int32));
     }
 
     // Roll back caches if not all drafts were accepted.
-    // For KVCacheSimple: set_position trims KV arrays to the accepted count.
-    // For MambaCache: set_position is a no-op — we restore from snapshot and re-run.
-    if (accepted < n_draft && !cache_.empty()) {
+    // Total emitted = 1 (d0) + accepted (verified) + 1 (y_) = accepted + 2.
+    // No rollback needed when accepted + 2 == n_draft, i.e., accepted == n_draft - 1.
+    if (accepted < n_draft - 1 && !cache_.empty()) {
         // Restore MambaCache to pre-verification state.
         for (size_t i = 0; i < cache_.size(); ++i) {
             if (saved_mamba[i].has_mamba) {
@@ -696,15 +699,13 @@ std::vector<int> TokenIterator::mtp_speculative_step() {
             c.set_position(trunk_cache_pos);
         }
 
-        // Re-run trunk on accepted tokens. Include original_y at the start so the
-        // trunk processes the full correct sequence [y_orig, d_0, ..., d_{k-1}].
-        // This advances the cache by accepted+1 (for y_orig + accepted tokens),
-        // and produces the correct hidden state for the next MTP draft.
+        // Re-run trunk on accepted tokens. Feed [d0, d1, ..., d_{accepted}].
+        // d0 is always accepted (not verified). d1...d_{accepted} were verified.
+        // This advances the cache by accepted+1 tokens.
         {
             std::vector<int32_t> rerun_seq;
             rerun_seq.reserve(1 + accepted);
-            rerun_seq.push_back(original_y);
-            for (int i = 0; i < accepted; ++i) {
+            for (int i = 0; i <= accepted; ++i) {
                 rerun_seq.push_back(static_cast<int32_t>(draft_tokens[i]));
             }
             auto rerun_arr = mx::array(rerun_seq.data(), {1, static_cast<int>(rerun_seq.size())}, mx::int32);
@@ -716,9 +717,6 @@ std::vector<int> TokenIterator::mtp_speculative_step() {
             maybe_quantize_kv_cache(cache_, kv_bits_, kv_group_size_, quantized_kv_start_);
             logits = result.logits;
         }
-
-        // The unified rerun above handles all cases including accepted==0
-        // (reruns [y_] only, advancing cache by 1).
     }
 
     // Capture trunk hidden state at last-used position for next MTP step.
@@ -742,14 +740,16 @@ std::vector<int> TokenIterator::mtp_speculative_step() {
     mtp_draft_proposed_ += n_draft;
     mtp_draft_accepted_ += accepted;
 
-    // Return first accepted token; remaining accepted drafts are buffered.
+    // Return first accepted token (d0); remaining accepted drafts are buffered.
+    // d0 is always emitted. d1...d_{accepted} were verified and buffered.
+    // If all verifiable drafts accepted, y_ holds the bonus token (also buffered).
     draft_buffer_.clear();
     for (size_t i = 1; i < draft_tokens.size() && static_cast<int>(i) <= accepted; ++i) {
         draft_buffer_.push_back(draft_tokens[i]);
     }
-    // When all drafts are accepted, y_ holds the trunk's bonus token prediction.
+    // When all verifiable drafts are accepted, y_ holds the trunk's bonus token.
     // Buffer it so it's emitted after the accepted draft tokens.
-    if (accepted == n_draft) {
+    if (accepted == n_draft - 1) {
         draft_buffer_.push_back(y_.tokens.item<int32_t>());
     }
     draft_buffer_idx_ = 0;
