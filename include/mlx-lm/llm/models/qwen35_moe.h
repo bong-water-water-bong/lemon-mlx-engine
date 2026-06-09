@@ -233,6 +233,10 @@ public:
     mlx::core::array embed_tokens(const mlx::core::array& input_ids) const;
     mlx::core::array embed_as_linear(const mlx::core::array& x) const;
     mlx::core::array apply_lm_head(const mlx::core::array& hidden) const;
+    mlx::core::array apply_norm(const mlx::core::array& hidden) const;
+    // Run layers WITHOUT the final RMSNorm. Returns pre-norm hidden states.
+    // The MTP head expects pre-norm hidden and applies its own normalization.
+    mlx::core::array forward_prenorm(const mlx::core::array& inputs, std::vector<KVCache>* cache = nullptr);
     std::unordered_map<std::string, mlx::core::array*> weight_map();
 
     const std::vector<Qwen35MoEDecoderLayer>& get_layers() const { return layers_; }

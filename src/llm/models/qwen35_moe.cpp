@@ -686,6 +686,36 @@ mx::array Qwen35MoEModelInner::apply_lm_head(const mx::array& hidden) const {
     return mx::matmul(hidden, mx::transpose(embed_tokens_weight_));
 }
 
+mx::array Qwen35MoEModelInner::apply_norm(const mx::array& hidden) const {
+    return mx::fast::rms_norm(hidden, norm_weight_, rms_norm_eps_);
+}
+
+mx::array Qwen35MoEModelInner::forward_prenorm(const mx::array& inputs, std::vector<KVCache>* cache) {
+    // Same as operator() but returns hidden BEFORE the final RMSNorm.
+    // The MTP head expects pre-norm hidden and applies its own normalization.
+    auto tokens = inputs;
+    if (tokens.ndim() < 2) {
+        tokens = mx::reshape(tokens, {1, static_cast<int>(tokens.size())});
+    }
+    auto h = mx::take(embed_tokens_weight_, tokens, 0);
+
+    int fa_idx = full_attention_interval_ - 1;
+    if (fa_idx >= static_cast<int>(layers_.size())) fa_idx = 0;
+
+    auto fa_mask = create_attention_mask(
+        h, cache && fa_idx < static_cast<int>(cache->size()) ? &(*cache)[fa_idx] : nullptr);
+
+    std::optional<mx::array> ssm_mask;
+
+    for (size_t i = 0; i < layers_.size(); ++i) {
+        KVCache* lc = (cache && i < cache->size()) ? &(*cache)[i] : nullptr;
+        auto attn_mask = layers_[i].is_linear() ? AttentionMask{} : fa_mask;
+        h = layers_[i](h, attn_mask, ssm_mask, lc);
+    }
+
+    return h;  // pre-norm
+}
+
 std::unordered_map<std::string, mx::array*> Qwen35MoEModelInner::weight_map() {
     std::unordered_map<std::string, mx::array*> map;
     map["embed_tokens.weight"] = &embed_tokens_weight_;
@@ -713,16 +743,20 @@ PrepareResult Qwen35MoEModel::prepare_impl(const LMInput& input, std::vector<KVC
 }
 
 LMOutput Qwen35MoEModel::call_impl(const LMInput::Text& input, std::vector<KVCache>* cache, const LMOutput::State* state) {
-    auto hidden = model_(input.tokens, cache);
+    // Use forward_prenorm to get hidden BEFORE the final RMSNorm.
+    // The MTP head expects pre-norm hidden and applies its own normalization.
+    // The lm_head needs post-norm hidden, so we apply the norm only for logits.
+    auto hidden = model_.forward_prenorm(input.tokens, cache);
+    auto post_norm = model_.apply_norm(hidden);
     if (state) {
         return LMOutput(
-            lm_head_weight_.has_value() ? linear_fwd(hidden, lm_head_weight_.value())
-                                         : model_.embed_as_linear(hidden),
-            LMOutput::State(std::nullopt, hidden));
+            lm_head_weight_.has_value() ? linear_fwd(post_norm, lm_head_weight_.value())
+                                         : model_.embed_as_linear(post_norm),
+            LMOutput::State(std::nullopt, hidden));  // Return PRE-norm hidden for MTP
     }
     return LMOutput(
-        lm_head_weight_.has_value() ? linear_fwd(hidden, lm_head_weight_.value())
-                                     : model_.embed_as_linear(hidden));
+        lm_head_weight_.has_value() ? linear_fwd(post_norm, lm_head_weight_.value())
+                                     : model_.embed_as_linear(post_norm));
 }
 
 mx::array Qwen35MoEModel::forward_impl(const mx::array& inputs, std::vector<KVCache>* cache) {
