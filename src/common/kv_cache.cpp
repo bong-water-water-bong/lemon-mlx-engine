@@ -275,22 +275,41 @@ void QuantizedKVCache::set_position(size_t pos) {
         return;
     }
 
-    // Calculate how many entries to remove
-    int delta = offset_ - target;
+    // Simplified: set_position(pos) means cache should contain tokens at
+    // positions 0..pos-1, so we keep exactly 'target' elements directly.
+    // This avoids incorrect calculations when offset tracking is inconsistent.
     int total = keys_->weight.shape(2);
-    int to_remove = std::min(delta, total);
+    int keep = target;
 
-    if (to_remove == total) {
+    // Defensive validation: ensure keep is in valid range
+    if (keep < 0) {
+        keep = 0;
+    }
+    if (keep > total) {
+        keep = total;
+    }
+
+    // Defensive validation: verify tensor dimensionality is 4D
+    if (keys_->weight.ndim() != 4 || keys_->scales.ndim() != 4 ||
+        keys_->biases.ndim() != 4) {
+        throw std::runtime_error(
+            "QuantizedKVCache::set_position requires 4D tensors");
+    }
+    if (values_->weight.ndim() != 4 || values_->scales.ndim() != 4 ||
+        values_->biases.ndim() != 4) {
+        throw std::runtime_error(
+            "QuantizedKVCache::set_position requires 4D tensors");
+    }
+
+    if (keep == 0) {
         // Remove all entries
         keys_ = std::nullopt;
         values_ = std::nullopt;
     } else {
-        // Slice QTuples to keep only valid entries
-        int keep = total - to_remove;
-
-        // Slice keys QTuple
-        auto k_shape = keys_->weight.shape();
-        int B = k_shape[0], H = k_shape[1], packed_D = k_shape[3];
+        // Slice QTuple structures to keep positions 0..keep-1
+        int B = keys_->weight.shape(0);
+        int H = keys_->weight.shape(1);
+        int packed_D = keys_->weight.shape(3);
         int scales_D = keys_->scales.shape(3);
 
         keys_ = QTuple{
@@ -303,8 +322,9 @@ void QuantizedKVCache::set_position(size_t pos) {
         };
 
         // Slice values QTuple
-        auto v_shape = values_->weight.shape();
-        B = v_shape[0]; H = v_shape[1]; packed_D = v_shape[3];
+        B = values_->weight.shape(0);
+        H = values_->weight.shape(1);
+        packed_D = values_->weight.shape(3);
         scales_D = values_->scales.shape(3);
 
         values_ = QTuple{
