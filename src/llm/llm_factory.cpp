@@ -393,6 +393,22 @@ static std::string derive_base_model_id(const std::string& delta_model_id) {
     return result;
 }
 
+// Recover the HuggingFace repo id ("org/repo") from a local HF cache path of
+// the form  .../models--<org>--<repo>/snapshots/<hash>/ . Returns "" if the
+// path is not an HF cache layout (e.g. an arbitrary local directory).
+static std::string repo_id_from_cache_path(const std::string& path_str) {
+    for (const auto& part : fs::path(path_str)) {
+        const std::string seg = part.string();
+        if (seg.rfind("models--", 0) == 0) {
+            const std::string body = seg.substr(8);  // after "models--"
+            const auto sep = body.find("--");
+            if (sep == std::string::npos) return "";
+            return body.substr(0, sep) + "/" + body.substr(sep + 2);
+        }
+    }
+    return "";
+}
+
 ModelContext load_mtp_delta_model(
     const std::string& delta_model_id,
     const std::string& cache_dir)
@@ -412,18 +428,34 @@ ModelContext load_mtp_delta_model(
         delta_dir = hub.snapshot_download(delta_model_id);
     }
 
-    // Step 2: Derive and download base model (full text backbone).
-    std::string base_model_id = derive_base_model_id(delta_model_id);
-    std::cerr << "[MTP] Delta model: " << delta_model_id
-              << ", base model: " << base_model_id << "\n";
-
+    // Step 2: Derive and resolve base model (full text backbone).
+    // If the delta was given as a local HF cache path, the base repo lives in a
+    // SIBLING cache dir under its own snapshot hash — not the delta's hash — so
+    // recover the repo id and resolve the base through the hub. Only fall back to
+    // naive "-MTP" string-stripping on the raw id when it is a plain repo id.
+    std::string base_model_id;
     std::string base_dir;
-    if (fs::exists(fs::path(base_model_id) / "config.json")) {
-        base_dir = base_model_id;
-    } else if (hub.is_cached(base_model_id)) {
-        base_dir = hub.model_directory(base_model_id);
+    const std::string delta_repo_id = repo_id_from_cache_path(delta_model_id);
+    if (!delta_repo_id.empty()) {
+        base_model_id = derive_base_model_id(delta_repo_id);
+        std::cerr << "[MTP] Delta model: " << delta_model_id
+                  << ", base model: " << base_model_id << "\n";
+        if (hub.is_cached(base_model_id)) {
+            base_dir = hub.model_directory(base_model_id);
+        } else {
+            base_dir = hub.snapshot_download(base_model_id);
+        }
     } else {
-        base_dir = hub.snapshot_download(base_model_id);
+        base_model_id = derive_base_model_id(delta_model_id);
+        std::cerr << "[MTP] Delta model: " << delta_model_id
+                  << ", base model: " << base_model_id << "\n";
+        if (fs::exists(fs::path(base_model_id) / "config.json")) {
+            base_dir = base_model_id;
+        } else if (hub.is_cached(base_model_id)) {
+            base_dir = hub.model_directory(base_model_id);
+        } else {
+            base_dir = hub.snapshot_download(base_model_id);
+        }
     }
 
     // Step 3: Load base model safetensors (full 32-layer text backbone).

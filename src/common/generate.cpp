@@ -530,12 +530,45 @@ TokenIterator::TokenIterator(
     generation_start_ = std::chrono::steady_clock::now();
 }
 
+// External-cache constructor WITH parameters — enables MTP speculative decoding
+// while reusing a persistent (multi-turn) KV cache. Mirrors the params-only
+// constructor's MTP setup but adopts the provided trunk cache instead of
+// allocating a fresh one.
+TokenIterator::TokenIterator(
+    ModelContext& context,
+    const LMInput& input,
+    std::vector<KVCache> cache,
+    const GenerateParameters& params)
+    : context_(context)
+    , y_(mx::array(0, mx::int32))  // placeholder, overwritten by prepare()
+    , cache_(std::move(cache))
+    , sampler_(AnySampler::from_params(params))
+    , processor_(AnyProcessor::from_params(params))
+    , max_tokens_(params.max_tokens)
+    , kv_bits_(params.kv_bits)
+    , kv_group_size_(params.kv_group_size)
+    , quantized_kv_start_(params.quantized_kv_start)
+    , use_mtp_(params.use_mtp && context.get_mtp_head_fn != nullptr
+               && context.new_mtp_cache_fn != nullptr)
+    , n_draft_tokens_(params.n_draft_tokens)
+    , accept_history_(kAcceptHistorySize, 1)
+{
+    if (use_mtp_) {
+        mtp_caches_ = context.new_mtp_cache_fn(params);
+        state_ = LMOutput::State();  // Empty state signals model to return hidden
+    }
+    prompt_prefill_time_ = measure([&]() {
+        prepare(input, params.prefill_step_size);
+    });
+    generation_start_ = std::chrono::steady_clock::now();
+}
+
 // ---------------------------------------------------------------------------
 // TokenIterator — MTP speculative decoding
 // ---------------------------------------------------------------------------
 
 std::vector<int> TokenIterator::mtp_speculative_step() {
-    // Fallback if MTP not available.
+    // Fallback to plain decode if MTP is not available on this context.
     if (!use_mtp_ || context_.get_mtp_head_fn == nullptr || context_.embed_fn == nullptr
         || context_.apply_lm_head_fn == nullptr) {
         auto token = step(y_);
@@ -546,57 +579,66 @@ std::vector<int> TokenIterator::mtp_speculative_step() {
 
     MTPHead* mtp_head = static_cast<MTPHead*>(context_.get_mtp_head_fn());
     int n_draft = current_draft_count();
-    int trunk_cache_pos = static_cast<int>(cache_.empty() ? 0 : cache_[0].get_position());
+    // Read the trunk's sequence position from a FULL-ATTENTION (non-Mamba)
+    // cache. This model is hybrid (Qwen3.5-Next): linear-attention layers use a
+    // MambaCache whose get_position() is 0, so cache_[0] (often a MambaCache)
+    // would report position 0. Using that as the rollback target would
+    // set_position(0) and WIPE every full-attention KV cache, destroying context
+    // (the cause of degenerate looping output under speculative decoding).
+    int trunk_cache_pos = 0;
+    for (auto& c : cache_) {
+        if (!c.as_mamba()) {
+            trunk_cache_pos = static_cast<int>(c.get_position());
+            break;
+        }
+    }
 
     // Reset MTP head cache to prevent stale KV pairs from previous speculative
     // steps (where drafts may have been rejected). Without this reset, the MTP
     // head's attention would attend to KV from rejected drafts, corrupting the
-    // hidden state and producing garbage output — especially on ROCm where
-    // 4-bit quantization amplifies the noise.
+    // hidden state and producing garbage output. The head's intra-step
+    // self-attention is over the (few) draft tokens it produces this step, whose
+    // RoPE relative phases are preserved regardless of the absolute base offset.
     for (auto& c : mtp_caches_) {
         c.set_position(0);
     }
 
-    // Embed the current token for MTP input.
-    auto token_embed = context_.embed_fn(y_.tokens);
-
-    // Draft phase: run MTP head n_draft times.
-    // MTP head requires (trunk_hidden, token_embed) — the trunk's post-norm
-    // hidden state as first input, not just the token embedding.
-    // Use cached trunk hidden if available (from previous step), otherwise
-    // fall back to token_embed (first step after prefill).
+    // Draft phase — correct Qwen3.5 MTP recurrence.
+    //
+    // d0 is the trunk's OWN already-computed next token (y_). It is trusted and
+    // never verified — feeding it through the MTP head's output-norm would be
+    // wrong (that norm belongs after the MTP decoder layer, not on the raw trunk
+    // hidden). The MTP head then drafts d1..d_{K-1}: for each, run the MTP
+    // decoder layer FIRST with the PREVIOUS token's embedding to advance the
+    // hidden state, THEN apply the head's output-norm + the (shared) lm_head and
+    // argmax. mtp_trunk_hidden_ is the trunk's pre-final-norm hidden at the
+    // position that predicted y_ (i.e. h0); MTPHead applies its own pre_fc_norm.
     auto hidden = mtp_trunk_hidden_.has_value()
         ? mtp_trunk_hidden_.value()
-        : token_embed;
-    // Defensive: ensure hidden is always 3D [1, 1, H].
-    // token_embed from embed_fn may be 2D [1, H] for 1D token input.
-    // The MTP head reads L = x.shape(1); a 2D input would give L=H=2560,
-    // causing reshape crashes downstream.
+        : context_.embed_fn(y_.tokens);
+    // Defensive: ensure hidden is always 3D [1, 1, H]. The MTP head reads
+    // L = x.shape(1); a 2D [1, H] input would give L=H, crashing downstream.
     if (hidden.ndim() == 2) {
         hidden = mx::reshape(hidden, {1, 1, hidden.shape(-1)});
     }
+
     std::vector<int> draft_tokens;
     draft_tokens.reserve(n_draft);
 
-    for (int i = 0; i < n_draft; ++i) {
-        // Apply output norm to get hidden state ready for lm_head.
-        auto norm_h = mtp_head->apply_output_norm(hidden);
+    int prev_token = y_.tokens.item<int32_t>();
+    draft_tokens.push_back(prev_token);  // d0 = y_ (trunk's confirmed next token)
 
-        // Apply trunk's lm_head to get draft logits.
-        auto logits = context_.apply_lm_head_fn(norm_h);
-
-        // Sample draft token (argmax for deterministic matching).
-        int draft_tok = mx::argmax(logits, -1).item<int32_t>();
-        draft_tokens.push_back(draft_tok);
-
-        // Embed draft token for next MTP step.
-        auto draft_arr = mx::array({draft_tok}, {1, 1}, mx::int32);
-        token_embed = context_.embed_fn(draft_arr);
-
-        // Run MTP head forward: hidden = mtp(hidden, embed(draft), mask, cache)
-        // For T=1 decode, use no mask.
-        hidden = (*mtp_head)(hidden, token_embed, AttentionMask{},
+    for (int i = 1; i < n_draft; ++i) {
+        // Run the MTP decoder layer with the previous token's embedding to
+        // advance the hidden state, THEN predict this draft token.
+        auto prev_embed = context_.embed_fn(mx::array({prev_token}, {1, 1}, mx::int32));
+        hidden = (*mtp_head)(hidden, prev_embed, AttentionMask{},
                             mtp_caches_.empty() ? nullptr : &mtp_caches_[0]);
+
+        auto norm_h = mtp_head->apply_output_norm(hidden);
+        auto logits = context_.apply_lm_head_fn(norm_h);
+        prev_token = mx::argmax(logits, -1).item<int32_t>();
+        draft_tokens.push_back(prev_token);
 
         mx::clear_cache();
     }
@@ -756,17 +798,19 @@ std::vector<int> TokenIterator::mtp_speculative_step() {
     mtp_draft_proposed_ += n_draft;
     mtp_draft_accepted_ += accepted;
 
-    // Return first accepted token (d0); remaining accepted drafts are buffered.
-    // d0 is always emitted. d1...d_{accepted} were verified and buffered.
-    // If all verifiable drafts accepted, y_ holds the bonus token (also buffered).
+    // Emit contract: this step emits exactly the accepted prefix
+    // [d0, d1, ..., d_{accepted}] (accepted+1 tokens), all of which are now
+    // committed to the trunk KV cache. d0 is returned immediately; d1..d_accepted
+    // are buffered and drained by subsequent next() calls.
+    //
+    // y_ holds the FOLLOWING token (the trunk's correction on a mismatch, or the
+    // bonus token when all drafts were accepted). It is NOT emitted or committed
+    // here — it becomes d0 of the next speculative step and is emitted exactly
+    // once there. Buffering it as well would double-emit it and desync the cache
+    // (the bug that produced doubled/looping output).
     draft_buffer_.clear();
     for (size_t i = 1; i < draft_tokens.size() && static_cast<int>(i) <= accepted; ++i) {
         draft_buffer_.push_back(draft_tokens[i]);
-    }
-    // When all verifiable drafts are accepted, y_ holds the trunk's bonus token.
-    // Buffer it so it's emitted after the accepted draft tokens.
-    if (accepted == n_draft - 1) {
-        draft_buffer_.push_back(y_.tokens.item<int32_t>());
     }
     draft_buffer_idx_ = 0;
 
@@ -789,7 +833,16 @@ int TokenIterator::current_draft_count() const {
     float accept_rate = static_cast<float>(sum) / (kAcceptHistorySize * n_draft_tokens_);
 
     // Adaptive: scale draft count by acceptance rate.
-    int adapted = std::max(1, static_cast<int>(n_draft_tokens_ * accept_rate));
+    //
+    // The floor is 2, NOT 1. With n_draft == 1 the draft loop (i = 1..n_draft-1)
+    // runs zero iterations, so the MTP head never runs, the verify loop never
+    // runs, accepted is trivially 0, and the system degenerates to plain greedy
+    // decode with NO acceptance signal — a stuck state the count can never climb
+    // out of. Keeping a floor of 2 guarantees at least one real draft (d1) and a
+    // live acceptance measurement every step, so the count can recover. (When the
+    // configured n_draft_tokens_ is 1, honor it and return 1.)
+    int floor = std::min(2, n_draft_tokens_);
+    int adapted = std::max(floor, static_cast<int>(n_draft_tokens_ * accept_rate));
     return std::min(adapted, n_draft_tokens_);
 }
 
@@ -806,11 +859,12 @@ std::optional<int> TokenIterator::next() {
     // MTP path: drain buffer first, then run speculative step.
     if (use_mtp_) {
         if (!draft_buffer_.empty() && draft_buffer_idx_ < draft_buffer_.size()) {
-            // Return a buffered draft token.
+            // Return an already-accepted, already-committed buffered token.
+            // Do NOT touch y_: it holds the correction/bonus token that the next
+            // speculative step emits as its d0. Overwriting y_ here would make the
+            // next step re-emit this buffered token (the doubled-output bug).
             int tok = draft_buffer_[draft_buffer_idx_++];
-            y_ = LMInput::Text(mx::array({tok}, {1}, mx::int32));
             token_count_++;
-            mx::eval(y_.tokens);
             return tok;
         }
 

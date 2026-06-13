@@ -268,6 +268,16 @@ public:
         std::optional<int> max_tokens = std::nullopt,
         int prefill_step_size = 512);
 
+    // Construct with an external (persistent, multi-turn) cache AND full
+    // parameters. Unlike the explicit-cache constructor above, this enables MTP
+    // speculative decoding when params.use_mtp is set and the model exposes an
+    // MTP head — so the chat/session path gets MTP without losing cache reuse.
+    TokenIterator(
+        ModelContext& context,
+        const LMInput& input,
+        std::vector<KVCache> cache,
+        const GenerateParameters& params);
+
     // Generate the next token. Returns nullopt when max_tokens is reached.
     // The caller is responsible for checking EOS conditions.
     std::optional<int> next();
