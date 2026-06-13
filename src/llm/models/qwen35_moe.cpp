@@ -749,9 +749,13 @@ Qwen35MoEModel::Qwen35MoEModel(const Qwen35MoEConfiguration& args)
     : config_(args), model_(args)
 {
     kv_heads_.resize(args.num_hidden_layers, args.num_key_value_heads);
-    if (!args.tie_word_embeddings) {
-        lm_head_weight_ = mx::zeros({args.vocab_size, args.hidden_size});
-    }
+    // Always allocate lm_head_weight_ so it is part of weight_map(). For TIED
+    // embeddings, sanitize() wires a packed quantized copy of the embedding into
+    // it, so the lm_head matmul runs through quantized_matmul (~4x less memory
+    // than the dequantized embedding table — the single largest per-token load).
+    // load_weights() clears it back to nullopt if the checkpoint provides no
+    // lm_head (legacy untied-fallback behavior).
+    lm_head_weight_ = mx::zeros({args.vocab_size, args.hidden_size});
 }
 
 PrepareResult Qwen35MoEModel::prepare_impl(const LMInput& input, std::vector<KVCache>& cache, int ws) {
@@ -796,7 +800,15 @@ std::vector<KVCache> Qwen35MoEModel::new_cache_impl(const GenerateParameters& pa
 
 std::unordered_map<std::string, mx::array>
 Qwen35MoEModel::sanitize_impl(std::unordered_map<std::string, mx::array> weights) {
-    if (config_.tie_word_embeddings) weights.erase("lm_head.weight");
+    // Tied-embedding lm_head wiring is handled at the end of this function (after
+    // key remapping), where we duplicate the PACKED quantized embedding into
+    // lm_head.* so the lm_head matmul uses quantized_matmul instead of the
+    // dequantized embedding. Drop any stale checkpoint lm_head here.
+    if (config_.tie_word_embeddings) {
+        weights.erase("lm_head.weight");
+        weights.erase("lm_head.scales");
+        weights.erase("lm_head.biases");
+    }
 
     // Stash mtp.* keys for MTPHead wiring.
     for (auto it = weights.begin(); it != weights.end(); ) {
@@ -920,6 +932,26 @@ Qwen35MoEModel::sanitize_impl(std::unordered_map<std::string, mx::array> weights
     for (auto& [key, value] : weights) {
         if (key.find("conv1d.weight") != std::string::npos && value.shape(-1) != 1) {
             value = mx::moveaxis(value, 2, 1);
+        }
+    }
+
+    // Tied embeddings: duplicate the PACKED embedding into lm_head.* so that
+    // register_quantized_weights() registers lm_head for quantized_matmul (the
+    // embedding itself is still dequantized for the table lookup). This makes the
+    // lm_head matmul load the 4-bit weight (~4x less memory) instead of the
+    // dequantized fp16 embedding — the dominant per-token load for large vocabs.
+    // Only meaningful when the embedding is quantized (has .scales); otherwise
+    // the duplicated lm_head is just a (cheap) reference to the same float table.
+    if (config_.tie_word_embeddings && std::getenv("MTP_NO_QLMHEAD") == nullptr) {
+        auto ew = weights.find("model.embed_tokens.weight");
+        auto es = weights.find("model.embed_tokens.scales");
+        if (ew != weights.end() && es != weights.end()) {
+            weights.insert_or_assign("lm_head.weight", ew->second);
+            weights.insert_or_assign("lm_head.scales", es->second);
+            auto eb = weights.find("model.embed_tokens.biases");
+            if (eb != weights.end()) {
+                weights.insert_or_assign("lm_head.biases", eb->second);
+            }
         }
     }
 
