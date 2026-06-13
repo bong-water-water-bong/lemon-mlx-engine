@@ -663,23 +663,28 @@ std::vector<int> TokenIterator::mtp_speculative_step() {
     auto draft_arr = mx::array(draft_seq.data(), {1, static_cast<int>(draft_seq.size())}, mx::int32);
     LMInput::Text draft_text(draft_arr);
 
-    // Save MambaCache state before trunk verification.
-    // MambaCache can't be trimmed like KVCacheSimple — its recurrent state
-    // includes info from all tokens processed. If drafts are rejected, we need
-    // to restore MambaCache to the pre-verification position and re-run on
-    // accepted tokens to keep it in sync with the attention KV cache.
+    // Enable per-token recurrent-state capture on the linear (Mamba) layers so a
+    // partially-accepted verify can be rolled back to the accepted prefix using
+    // the "gated-delta intermediates" — without re-running the trunk. A snapshot
+    // is also taken as a cheap safety fallback (used only if capture is missing).
     struct SavedMambaState {
         MambaCache::Snapshot snapshot;
         bool has_mamba = false;
     };
+    // MTP_NO_INTERMEDIATES=1 forces the legacy restore+re-run rollback (for
+    // A/B profiling of the gated-delta intermediates path).
+    static const bool kUseIntermediates = (std::getenv("MTP_NO_INTERMEDIATES") == nullptr);
     std::vector<SavedMambaState> saved_mamba;
     saved_mamba.reserve(cache_.size());
+    bool any_mamba = false;
     for (auto& c : cache_) {
         if (auto* m = c.as_mamba()) {
             SavedMambaState s;
             s.snapshot = m->snapshot();
             s.has_mamba = true;
             saved_mamba.push_back(s);
+            if (kUseIntermediates) m->set_capture_spec(true);
+            any_mamba = true;
         } else {
             saved_mamba.push_back({});
         }
@@ -731,63 +736,83 @@ std::vector<int> TokenIterator::mtp_speculative_step() {
         y_ = LMInput::Text(mx::array({draft_tokens[accepted + 1]}, {1}, mx::int32));
     }
 
-    // Roll back caches if not all drafts were accepted.
-    // Total emitted = 1 (d0) + accepted (verified) + 1 (y_) = accepted + 2.
-    // No rollback needed when accepted + 2 == n_draft, i.e., accepted == n_draft - 1.
-    if (accepted < n_draft - 1 && !cache_.empty()) {
-        // Restore MambaCache to pre-verification state.
+    // ---- Commit the accepted prefix WITHOUT re-running the trunk ----
+    //
+    // The verification forward already advanced every cache by n_draft tokens and
+    // produced hidden states for all of them. Causal attention/recurrence means
+    // the hidden at position `accepted` (which predicts y_) is IDENTICAL to what a
+    // re-run on [d0..d_accepted] would produce, and each linear layer's recurrent
+    // state as-of the accepted prefix was captured per-token during the forward
+    // (the gated-delta intermediates). So we trim the caches to the accepted
+    // prefix directly instead of restoring + re-running the whole trunk.
+
+    // Capture the next-step trunk hidden at the position that predicts y_.
+    auto capture_hidden_at = [&](int pos) {
+        if (result.state.has_value() && result.state->hidden_intermediates.has_value()) {
+            auto trunk_h = result.state->hidden_intermediates.value();
+            int p = std::min(pos, static_cast<int>(trunk_h.shape(1)) - 1);
+            if (p < 0) p = 0;
+            auto h_slice = mx::slice(trunk_h, {0, p, 0}, {1, p + 1, trunk_h.shape(2)});
+            mx::eval(h_slice);
+            mtp_trunk_hidden_ = h_slice;
+        }
+    };
+
+    // Did every linear layer capture its per-token states this step?
+    bool have_spec = any_mamba;
+    if (any_mamba) {
+        for (auto& c : cache_) {
+            if (auto* m = c.as_mamba()) {
+                if (!m->has_spec()) { have_spec = false; break; }
+            }
+        }
+    }
+
+    if (accepted == n_draft - 1) {
+        // All drafts accepted — caches already hold exactly [d0..d_{n-1}].
+        capture_hidden_at(n_draft - 1);
+    } else if (any_mamba && !have_spec) {
+        // Safety fallback (should not happen on ROCm): restore the recurrent
+        // state and re-run the trunk on the accepted prefix [d0..d_accepted].
         for (size_t i = 0; i < cache_.size(); ++i) {
             if (saved_mamba[i].has_mamba) {
                 auto* m = cache_[i].as_mamba();
                 if (m) m->restore(saved_mamba[i].snapshot);
             }
         }
-
-        // Roll back all caches to pre-verification position, then re-run
-        // forward pass on accepted tokens only. This keeps Mamba and KV
-        // caches in sync: both advance from trunk_cache_pos by accepted count.
+        for (auto& c : cache_) c.set_position(trunk_cache_pos);
+        std::vector<int32_t> rerun_seq;
+        rerun_seq.reserve(1 + accepted);
+        for (int i = 0; i <= accepted; ++i) {
+            rerun_seq.push_back(static_cast<int32_t>(draft_tokens[i]));
+        }
+        auto rerun_arr = mx::array(rerun_seq.data(), {1, static_cast<int>(rerun_seq.size())}, mx::int32);
+        LMInput::Text rerun_text(rerun_arr);
+        auto rerun_state = LMOutput::State(std::nullopt, std::optional<mx::array>(mx::array(0.0f)));
+        result = context_.call_fn(rerun_text, &cache_, &rerun_state);
+        state_ = result.state;
+        maybe_quantize_kv_cache(cache_, kv_bits_, kv_group_size_, quantized_kv_start_);
+        logits = result.logits;
+        capture_hidden_at(accepted);
+    } else if (accepted < n_draft - 1 && !cache_.empty()) {
+        // Fast path: trim caches to [d0..d_accepted] using the gated-delta
+        // intermediates (linear layers) and set_position (attention layers).
+        capture_hidden_at(accepted);
+        int keep_pos = trunk_cache_pos + accepted + 1;
         for (auto& c : cache_) {
-            c.set_position(trunk_cache_pos);
-        }
-
-        // Also roll back MTP head caches to prevent stale KV from rejected
-        // drafts. The MTP head's cache must stay aligned with the trunk's
-        // cache position for correct speculative decoding.
-        for (auto& c : mtp_caches_) {
-            c.set_position(trunk_cache_pos);
-        }
-
-        // Re-run trunk on accepted tokens. Feed [d0, d1, ..., d_{accepted}].
-        // d0 is always accepted (not verified). d1...d_{accepted} were verified.
-        // This advances the cache by accepted+1 tokens.
-        {
-            std::vector<int32_t> rerun_seq;
-            rerun_seq.reserve(1 + accepted);
-            for (int i = 0; i <= accepted; ++i) {
-                rerun_seq.push_back(static_cast<int32_t>(draft_tokens[i]));
+            if (auto* m = c.as_mamba()) {
+                m->rollback_spec(accepted + 1);
+            } else {
+                c.set_position(keep_pos);
             }
-            auto rerun_arr = mx::array(rerun_seq.data(), {1, static_cast<int>(rerun_seq.size())}, mx::int32);
-            LMInput::Text rerun_text(rerun_arr);
-
-            auto rerun_state = LMOutput::State(std::nullopt, std::optional<mx::array>(mx::array(0.0f)));
-            result = context_.call_fn(rerun_text, &cache_, &rerun_state);
-            state_ = result.state;
-            maybe_quantize_kv_cache(cache_, kv_bits_, kv_group_size_, quantized_kv_start_);
-            logits = result.logits;
         }
+    } else {
+        capture_hidden_at(accepted);
     }
 
-    // Capture trunk hidden state at last-used position for next MTP step.
-    // The MTP head needs the trunk's post-norm hidden state as input.
-    // After the rollback + re-run logic above, result.state now reflects
-    // the tokens that are actually in the cache + the emitted y_ token.
-    if (result.state.has_value() && result.state->hidden_intermediates.has_value()) {
-        auto trunk_h = result.state->hidden_intermediates.value();
-        int last_pos = trunk_h.shape(1) - 1;  // last position in the actual result
-        // Slice at position last_pos -> [1, 1, H]. Keep 3D shape for MTPDecoderLayer.
-        auto h_slice = mx::slice(trunk_h, {0, last_pos, 0}, {1, last_pos + 1, trunk_h.shape(2)});
-        mx::eval(h_slice);
-        mtp_trunk_hidden_ = h_slice;
+    // Clear the capture flag and any leftover per-token states for next step.
+    for (auto& c : cache_) {
+        if (auto* m = c.as_mamba()) m->set_capture_spec(false);
     }
 
     // Record acceptance for adaptive draft length.

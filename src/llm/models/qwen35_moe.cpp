@@ -414,8 +414,24 @@ mx::array Qwen35MoEGatedDeltaNet::operator()(
         ssm_state = (*cache)[1].value();
     }
 
-    auto [out, new_state] = gated_delta_update(
-        q_out, k_out, v_out, a_val, b_val, a_log_, dt_bias_, ssm_state, mask);
+    mx::array out = mx::array(0.0f);
+    mx::array new_state = mx::array(0.0f);
+    if (cache && cache->capture_spec()) {
+        // Speculative verify forward: also capture the per-token recurrent state
+        // stack (and the full conv input) so the linear-layer state can be rolled
+        // back to an accepted draft prefix without re-running the trunk.
+        int base_off = cache->offset();
+        auto [o, ns, seq] = gated_delta_update_seq(
+            q_out, k_out, v_out, a_val, b_val, a_log_, dt_bias_, ssm_state, mask);
+        out = o;
+        new_state = ns;
+        cache->store_spec(seq, conv_input, base_off);
+    } else {
+        auto [o, ns] = gated_delta_update(
+            q_out, k_out, v_out, a_val, b_val, a_log_, dt_bias_, ssm_state, mask);
+        out = o;
+        new_state = ns;
+    }
 
     if (cache) {
         (*cache)[1] = new_state;

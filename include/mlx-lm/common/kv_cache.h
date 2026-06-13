@@ -209,9 +209,72 @@ public:
 
     // Partial-rollback API: MambaCache does not support token-level rollback
     // via set_position (recurrent state cannot be trimmed). Use snapshot/restore
-    // instead for speculative decoding.
+    // or the spec-capture API below for speculative decoding.
     size_t get_position() const { return static_cast<size_t>(offset_); }
     void set_position(size_t /*pos*/) { /* no-op: recurrent state cannot be rolled back */ }
+
+    // --- Speculative-decoding intermediates ("gated-delta intermediates") ---
+    //
+    // To roll the recurrent state back to an accepted prefix WITHOUT re-running
+    // the trunk, the gated-delta layer records, during a multi-token verify
+    // forward, the SSM state after EACH token plus the full conv input. We then
+    // pick the state as-of the accepted prefix. Capture is opt-in (set per step
+    // by the speculative loop) so the large prompt prefill never pays for it.
+    void set_capture_spec(bool v) { capture_spec_ = v; if (!v) clear_spec(); }
+    bool capture_spec() const { return capture_spec_; }
+    bool has_spec() const { return spec_ssm_states_.has_value(); }
+
+    // Called by the gated-delta layer when capture_spec() is true.
+    //   ssm_states_seq: [B, T, Hv, Dv, Dk] — recurrent state AFTER each token.
+    //   conv_input:     [B, (kernel-1)+T, conv_dim] — full conv input this step.
+    //   base_offset:    cache offset before this verify forward.
+    void store_spec(const mlx::core::array& ssm_states_seq,
+                    const mlx::core::array& conv_input,
+                    int base_offset) {
+        spec_ssm_states_ = ssm_states_seq;
+        spec_conv_input_ = conv_input;
+        spec_base_offset_ = base_offset;
+    }
+
+    void clear_spec() {
+        spec_ssm_states_ = std::nullopt;
+        spec_conv_input_ = std::nullopt;
+    }
+
+    // Roll the recurrent + conv state back to the first `keep` tokens of the
+    // captured verify chunk (keep >= 1). Sets ssm_state to the state after token
+    // keep-1, conv_state to the (kernel-1)-token window ending at token keep-1,
+    // and offset to base_offset + keep. No-op if no intermediates were captured.
+    // The conv window size (kernel-1) is derived from the captured shapes.
+    void rollback_spec(int keep) {
+        if (!spec_ssm_states_.has_value() || !spec_conv_input_.has_value()) return;
+        namespace mx = mlx::core;
+        const auto& seq = spec_ssm_states_.value();   // [B, T, Hv, Dv, Dk]
+        const auto& ci = spec_conv_input_.value();    // [B, (k-1)+T, conv_dim]
+        int T = seq.shape(1);
+        int win = ci.shape(1) - T;                    // (kernel-1) prev-state rows
+        if (keep < 1) keep = 1;
+        if (keep > T) keep = T;
+
+        // ssm_state after `keep` tokens == seq[:, keep-1].
+        states_[1] = mx::squeeze(
+            mx::slice(seq, {0, keep - 1, 0, 0, 0},
+                      {seq.shape(0), keep, seq.shape(2), seq.shape(3), seq.shape(4)}),
+            1);
+
+        // conv_state == window [keep, keep + (kernel-1)) of the full conv input.
+        states_[0] = mx::slice(ci, {0, keep, 0},
+                               {ci.shape(0), keep + win, ci.shape(2)});
+
+        offset_ = spec_base_offset_ + keep;
+        clear_spec();
+    }
+
+private:
+    bool capture_spec_ = false;
+    std::optional<mlx::core::array> spec_ssm_states_;  // [B, T, Hv, Dv, Dk]
+    std::optional<mlx::core::array> spec_conv_input_;  // [B, (k-1)+T, conv_dim]
+    int spec_base_offset_ = 0;
 };
 
 // Compound cache for hybrid models (e.g., FalconH1, BaichuanM1).
