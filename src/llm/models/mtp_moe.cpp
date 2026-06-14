@@ -34,7 +34,10 @@ MTPDecoderLayerMoE::MTPDecoderLayerMoE(const MTPHeadConfig& args, int num_expert
       input_layernorm_weight_(mx::ones({args.hidden_size})),
       post_attention_layernorm_weight_(mx::ones({args.hidden_size})),
       gate_weight_(mx::zeros({num_experts, args.hidden_size})),
-      switch_mlp_(args.hidden_size, args.intermediate_size, num_experts),
+      switch_mlp_(args.hidden_size,
+                  args.moe_intermediate_size > 0 ? args.moe_intermediate_size
+                                                 : args.intermediate_size,
+                  num_experts),
       shared_expert_gate_weight_(mx::zeros({1, args.hidden_size})),
       shared_expert_(args.hidden_size, args.shared_expert_intermediate_size > 0
                          ? args.shared_expert_intermediate_size

@@ -19,6 +19,7 @@ struct MTPHeadConfig {
     // MoE-specific fields (zero = dense mode).
     int num_experts = 0;
     int num_experts_per_tok = 1;
+    int moe_intermediate_size = 0;  // per-expert hidden dim (falls back to intermediate_size)
     int shared_expert_intermediate_size = 0;
 
     int resolved_head_dim() const {

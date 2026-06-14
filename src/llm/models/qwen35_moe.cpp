@@ -1133,8 +1133,14 @@ void Qwen35MoEModel::build_mtp_head() {
                     cfg.num_attention_heads = inferred_heads;
                 }
             }
-        } else if (key.find("mlp.gate_proj.weight") != std::string::npos ||
-                   key.find("mlp.up_proj.weight") != std::string::npos) {
+        } else if ((key.find("mlp.gate_proj.weight") != std::string::npos ||
+                    key.find("mlp.up_proj.weight") != std::string::npos) &&
+                   key.find("switch_mlp") == std::string::npos &&
+                   key.find("shared_expert") == std::string::npos) {
+            // Dense MLP only: the MoE keys (switch_mlp.gate_proj.weight,
+            // shared_expert.gate_proj.weight) also contain "mlp.gate_proj.weight"
+            // but are 3D [E,inter,hidden] / have a different layout, which would
+            // set intermediate_size/hidden_size to garbage.
             if (weight.ndim() >= 1) {
                 if (cfg.intermediate_size == 0) cfg.intermediate_size = weight.shape(0);
                 if (cfg.hidden_size == 0) cfg.hidden_size = weight.shape(1);
@@ -1162,9 +1168,21 @@ void Qwen35MoEModel::build_mtp_head() {
               << (used_fallback ? " (used base model fallback)" : " (weight-derived)")
               << std::endl;
 
-    // MTP head always uses dense SwiGLU MLP (gate_proj/up_proj/down_proj).
-    // Checkpoint does NOT contain MoE routing weights for the MTP head.
-    mtp_head_ = MTPHead(cfg);
+    // This checkpoint's MTP head is a FULL MoE layer (mlp.gate router,
+    // mlp.switch_mlp.{gate,up,down}_proj over num_experts, shared_expert*). Build
+    // it as MoE so those weights actually load; building it dense drops every
+    // switch_mlp/gate/shared_expert key, leaving the head's MLP at zero and the
+    // drafts garbage (MTP acceptance stuck at 0).
+    cfg.num_experts = config_.num_experts;
+    cfg.num_experts_per_tok = config_.num_experts_per_tok;
+    cfg.moe_intermediate_size = config_.moe_intermediate_size;
+    cfg.shared_expert_intermediate_size = config_.shared_expert_intermediate_size;
+
+    if (cfg.is_moe()) {
+        mtp_head_ = MTPHead::create_moe(cfg);
+    } else {
+        mtp_head_ = MTPHead(cfg);
+    }
     mtp_head_->load_mtp_weights(mtp_weights_);
 }
 
