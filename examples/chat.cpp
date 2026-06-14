@@ -6,11 +6,56 @@
 #include <mlx-lm/common/generate.h>
 #include <mlx-lm/common/model_container.h>
 #include <mlx/mlx.h>
+#include <cstdlib>
 #include <iostream>
 #include <set>
 #include <string>
 
 namespace mx = mlx::core;
+
+// GPU selection / enumeration. Selecting a device sets HIP_VISIBLE_DEVICES
+// before any HIP/MLX call so the chosen GPU becomes device 0 (which the MLX
+// ROCm backend uses); the backend's is_integrated() then auto-detects whether
+// it's the integrated APU (unified memory) or a discrete GPU (VRAM + host
+// staging) and routes the allocator accordingly. Works on any system with one
+// or more GPUs. Listing shells out to rocm-smi to avoid a HIP header dependency
+// in this host-only example.
+static void select_or_list_gpu(int argc, char* argv[]) {
+    // Let each GPU report its TRUE arch. A global HSA_OVERRIDE_GFX_VERSION
+    // (e.g. 11.5.1 for a gfx1151 APU, often set in a shell profile) would force
+    // a discrete gfx1201 GPU to also masquerade as gfx1151 — the runtime then
+    // runs gfx1151 ISA on RDNA4 silicon and faults. Unsetting it makes the APU
+    // report gfx1151 and the R9700 report gfx1201, so both work and auto-detect.
+    unsetenv("HSA_OVERRIDE_GFX_VERSION");
+
+    bool list = false;
+    int device = -1;
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "--list-devices")
+            list = true;
+        else if (a == "--device" && i + 1 < argc)
+            device = std::atoi(argv[i + 1]);
+    }
+    if (list) {
+        std::cout << "Available GPUs (HIP device index = order shown by "
+                     "rocm-smi):\n";
+        int rc = std::system(
+            "rocm-smi --showproductname 2>/dev/null | grep -iE 'GPU\\[|Card "
+            "Series|GFX Version' || rocminfo 2>/dev/null | grep -iE 'Marketing "
+            "Name|gfx1|gfx9'");
+        (void)rc;
+        std::cout << "\nSelect with:  --device N   (N = HIP device index; "
+                     "default is 0)\n";
+        std::exit(0);
+    }
+    if (device >= 0) {
+        // Must be set before the HIP runtime initializes (first HIP call).
+        setenv("HIP_VISIBLE_DEVICES", std::to_string(device).c_str(), 1);
+        std::cerr << "Selecting GPU index " << device
+                  << " (HIP_VISIBLE_DEVICES=" << device << ")\n";
+    }
+}
 
 static std::string format_bytes(size_t bytes) {
     if (bytes >= 1024ULL * 1024 * 1024)
@@ -37,6 +82,8 @@ struct CliArgs {
     int ctx_size = 0;       // Context size for KV cache pre-allocation (0=auto)
     bool use_mtp = false;
     int n_draft_tokens = 1;
+    int device = -1;          // GPU index to use (-1 = auto / default device 0)
+    bool list_devices = false;
 };
 
 static CliArgs parse_args(int argc, char* argv[]) {
@@ -55,7 +102,9 @@ static CliArgs parse_args(int argc, char* argv[]) {
                   << "  --kv-group-size N       KV cache quant group size (default: 64)\n"
                   << "  --ctx-size N            Pre-allocate KV cache for N tokens (0=auto)\n"
                   << "  --use-mtp               Enable MTP speculative decode (scaffolding)\n"
-                  << "  --n-draft N             MTP draft tokens per step (default: 1)\n";
+                  << "  --n-draft N             MTP draft tokens per step (default: 1)\n"
+                  << "  --device N              GPU index to run on (default: auto)\n"
+                  << "  --list-devices          List available GPUs and exit\n";
         std::exit(1);
     }
     args.model_path = argv[1];
@@ -87,12 +136,19 @@ static CliArgs parse_args(int argc, char* argv[]) {
             args.use_mtp = true;
         } else if (flag == "--n-draft" && i + 1 < argc) {
             args.n_draft_tokens = std::stoi(argv[++i]);
+        } else if (flag == "--device" && i + 1 < argc) {
+            args.device = std::stoi(argv[++i]);
+        } else if (flag == "--list-devices") {
+            args.list_devices = true;
         }
     }
     return args;
 }
 
 int main(int argc, char* argv[]) {
+    // Handle --list-devices / --device before anything touches HIP/MLX.
+    select_or_list_gpu(argc, argv);
+
     auto args = parse_args(argc, argv);
 
     if (args.memory_limit_mb > 0) {
