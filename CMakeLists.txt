@@ -233,6 +233,9 @@ if(MLX_LM_BUILD_EXAMPLES)
     add_executable(test_gdn examples/test_gdn.cpp)
     target_link_libraries(test_gdn PRIVATE mlx)
 
+    add_executable(graph_probe examples/graph_probe.cpp)
+    target_link_libraries(graph_probe PRIVATE mlx)
+
     add_executable(server
         examples/server.cpp
         src/common/server.cpp
