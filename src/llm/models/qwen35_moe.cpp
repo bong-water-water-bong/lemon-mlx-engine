@@ -485,13 +485,22 @@ mx::array Qwen35MoEGatedDeltaNet::operator()(
                         mx::reshape(kt, {B_, Hk_, 1, Dk_}), {B_, Hk_, rep_, Dk_}), {B_, Hv_, Dk_});
                 }
 
-                // GDN recurrence
+                // GDN recurrence. The two state·vector contractions over Dk
+                //   kv_mem[b,h,v] = sum_k s[b,h,v,k] * kt[b,h,k]
+                //   y[b,h,v]      = sum_k s[b,h,v,k] * qt[b,h,k]
+                // are batched matrix-vector products s[Dv,Dk]·vec[Dk]. Express
+                // them as matmul so one GEMV kernel does the multiply+accumulate
+                // — avoids materializing the [B,Hv,Dv,Dk] product and the separate
+                // row_reduce (was ~3.15ms + part of the elementwise/token). Same
+                // math (fp accumulate over Dk), exact-equivalent.
                 auto decay = mx::expand_dims(mx::expand_dims(gt, -1), -1);
                 auto s = mx::multiply(state, decay);
-                auto kv_mem = mx::sum(mx::multiply(s, mx::expand_dims(kt, -2)), -1);
+                auto kv_mem = mx::squeeze(
+                    mx::matmul(s, mx::expand_dims(kt, -1)), -1);
                 auto delta = mx::multiply(mx::subtract(vt, kv_mem), mx::expand_dims(bt, -1));
                 s = mx::add(s, mx::multiply(mx::expand_dims(kt, -2), mx::expand_dims(delta, -1)));
-                auto y = mx::sum(mx::multiply(s, mx::expand_dims(qt, -2)), -1);
+                auto y = mx::squeeze(
+                    mx::matmul(s, mx::expand_dims(qt, -1)), -1);
 
                 return {mx::expand_dims(y, 1), s};
             },
