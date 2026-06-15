@@ -859,8 +859,10 @@ std::vector<int> TokenIterator::mtp_speculative_step() {
         auto logits = context_.apply_lm_head_fn(norm_h);
         prev_token = mx::argmax(logits, -1).item<int32_t>();
         draft_tokens.push_back(prev_token);
-
-        mx::clear_cache();
+        // NOTE: do NOT mx::clear_cache() here. Freeing the whole buffer pool
+        // after every draft forces the next draft (and the verify) to re-allocate
+        // from the driver, adding ms of overhead inside the speculative hot loop.
+        // The main generation loop already clears periodically (every 256 tokens).
     }
     if (kMtpTiming) t_draft = std::chrono::steady_clock::now();
 
