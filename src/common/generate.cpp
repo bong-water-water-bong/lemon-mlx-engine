@@ -458,12 +458,24 @@ mx::array TokenIterator::step(const LMInput::Text& previous) {
                 g_init = true;
             }
             auto write_token = [&]() {
-                // dtype-agnostic copy of the single token id into the fixed buffer
-                mx::eval(batched.tokens);
-                std::memcpy(reinterpret_cast<void*>(g_input.data<char>()),
-                            reinterpret_cast<const void*>(batched.tokens.data<char>()),
-                            batched.tokens.itemsize());
+                // Update the fixed input buffer's CONTENTS in place via a GPU op,
+                // NOT a host memcpy. The R9700 is a discrete GPU whose device-local
+                // buffers are not host-coherent — a host memcpy into g_input.data()
+                // never reaches the device, so the captured embedding gather reads
+                // stale/garbage indices on replay -> OOB -> GPU queue hang.
+                // slice_update over the full range runs a GPU kernel (device-
+                // coherent) and DONATES g_input's buffer in place (refcount==1),
+                // so g_input keeps the fixed address the captured graph baked in.
+                int32_t tok = batched.tokens.item<int32_t>();
+                auto t = mx::astype(mx::array(tok), g_input.dtype());
+                g_input = mx::slice_update(
+                    g_input, mx::broadcast_to(t, g_input.shape()),
+                    mx::Shape(g_input.ndim(), 0), g_input.shape());
+                mx::eval(g_input);
             };
+            // --- bisect toggles ---
+            static const bool g_nowarm = std::getenv("MLX_GRAPH_NOWARM") != nullptr;
+            static const bool g_natural = std::getenv("MLX_GRAPH_NATURAL") != nullptr;
             if (!g_captured) {
                 if (++g_warm >= 6) {
                     // Warm the allocator pools with a few eager forwards so the
@@ -472,7 +484,8 @@ mx::array TokenIterator::step(const LMInput::Text& previous) {
                     // slice_update donates in place (refcount==1), keeping the KV
                     // buffer addresses stable for replay, and cache_ keeps them
                     // alive across steps.
-                    for (int w = 0; w < 4; w++) {
+                    int n_warm = g_nowarm ? 0 : 4;
+                    for (int w = 0; w < n_warm; w++) {
                         write_token();
                         auto rw = context_.call_fn(
                             LMInput::Text(g_input, batched.mask), cache_ptr, state_ptr);
@@ -482,18 +495,30 @@ mx::array TokenIterator::step(const LMInput::Text& previous) {
                         state_ptr = state_.has_value() ? &state_.value() : nullptr;
                     }
                     write_token();
-                    // Pin the captured step's INPUT SSM state so it is not freed
-                    // when state_ is reassigned below — the captured graph reads
-                    // its buffer on every replay. (The KV cache donates in place,
-                    // so its buffer is already stable and held by cache_.)
+                    // Pin the WHOLE pre-capture cache (KV + Mamba) by copying the
+                    // cache vector — this is exactly what the working bench does.
+                    // The copy bumps every cache buffer's refcount to >=2, which:
+                    //   (1) forces KVCacheSimple.slice_update to COPY (not donate)
+                    //       during the capture forward, so the graph's KV read
+                    //       source and write destination are DISTINCT buffers that
+                    //       both stay alive (an in-place donation would alias them
+                    //       and fault on replay); and
+                    //   (2) keeps the gated-delta MambaCache conv/ssm buffers the
+                    //       graph reads alive after the forward replaces (*m)[i].
+                    // Held static for the captured graph's whole lifetime.
+                    static std::vector<KVCache> g_pinned_cache;
+                    g_pinned_cache = cache_;
                     static std::optional<LMOutput::State> g_pinned_state;
                     g_pinned_state = state_;
                     cache_ptr = cache_.empty() ? nullptr : &cache_;
                     state_ptr = g_pinned_state.has_value() ? &g_pinned_state.value() : nullptr;
-                    std::cerr << "[graph] warm done; begin_capture" << std::endl;
+                    std::cerr << "[graph] warm done; pinned whole cache ("
+                              << g_pinned_cache.size() << " entries); begin_capture"
+                              << std::endl;
                     gpu::gpu_graph_begin_capture();
                     auto rc = context_.call_fn(
-                        LMInput::Text(g_input, batched.mask), cache_ptr, state_ptr);
+                        g_natural ? batched : LMInput::Text(g_input, batched.mask),
+                        cache_ptr, state_ptr);
                     std::cerr << "[graph] call_fn recorded; eval" << std::endl;
                     mx::eval(rc.logits);
                     std::cerr << "[graph] eval recorded; end_capture" << std::endl;
