@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <numeric>
 #include <sstream>
@@ -426,6 +427,101 @@ mx::array TokenIterator::step(const LMInput::Text& previous) {
             gpu::gpu_graph_reset();
             if (use_arena) gpu::gpu_arena_end();
             std::_Exit(ok ? 0 : 1);
+        }
+    }
+#endif
+
+    // --- HIP graph replay decode (opt-in via MLX_DECODE_GRAPH) ---
+    // Capture the decode step once after warmup, then replay it per token,
+    // writing the new input token into a fixed buffer that the captured
+    // embedding gather reads. The captured graph holds the KV length/offset from
+    // capture time, so output is only correct while context length matches —
+    // this measures the achievable live graph-replay tok/s; growing-KV
+    // correctness is the next step.
+#if defined(MLX_BUILD_ROCM)
+    {
+        static const bool g_graph = std::getenv("MLX_DECODE_GRAPH") != nullptr;
+        if (g_graph) {
+            namespace gpu = mlx::core;
+            static int g_warm = 0;
+            static bool g_captured = false;
+            static bool g_init = false;
+            static mx::array g_input = mx::zeros({1, 1}, mx::int32);
+            static mx::array g_logits = mx::zeros({1}, mx::float32);
+            static int g_n = 0;
+            static double g_ms = 0.0;
+            auto* cache_ptr = cache_.empty() ? nullptr : &cache_;
+            auto* state_ptr = state_.has_value() ? &state_.value() : nullptr;
+            if (!g_init) {
+                g_input = mx::zeros(batched.tokens.shape(), batched.tokens.dtype());
+                mx::eval(g_input);
+                g_init = true;
+            }
+            auto write_token = [&]() {
+                // dtype-agnostic copy of the single token id into the fixed buffer
+                mx::eval(batched.tokens);
+                std::memcpy(reinterpret_cast<void*>(g_input.data<char>()),
+                            reinterpret_cast<const void*>(batched.tokens.data<char>()),
+                            batched.tokens.itemsize());
+            };
+            if (!g_captured) {
+                if (++g_warm >= 6) {
+                    // Warm the allocator pools with a few eager forwards so the
+                    // captured forward (which cannot call hipMalloc while the
+                    // stream is capturing) reuses pooled buffers. No pin/restore:
+                    // slice_update donates in place (refcount==1), keeping the KV
+                    // buffer addresses stable for replay, and cache_ keeps them
+                    // alive across steps.
+                    for (int w = 0; w < 4; w++) {
+                        write_token();
+                        auto rw = context_.call_fn(
+                            LMInput::Text(g_input, batched.mask), cache_ptr, state_ptr);
+                        mx::eval(rw.logits);
+                        state_ = rw.state;
+                        cache_ptr = cache_.empty() ? nullptr : &cache_;
+                        state_ptr = state_.has_value() ? &state_.value() : nullptr;
+                    }
+                    write_token();
+                    // Pin the captured step's INPUT SSM state so it is not freed
+                    // when state_ is reassigned below — the captured graph reads
+                    // its buffer on every replay. (The KV cache donates in place,
+                    // so its buffer is already stable and held by cache_.)
+                    static std::optional<LMOutput::State> g_pinned_state;
+                    g_pinned_state = state_;
+                    cache_ptr = cache_.empty() ? nullptr : &cache_;
+                    state_ptr = g_pinned_state.has_value() ? &g_pinned_state.value() : nullptr;
+                    std::cerr << "[graph] warm done; begin_capture" << std::endl;
+                    gpu::gpu_graph_begin_capture();
+                    auto rc = context_.call_fn(
+                        LMInput::Text(g_input, batched.mask), cache_ptr, state_ptr);
+                    std::cerr << "[graph] call_fn recorded; eval" << std::endl;
+                    mx::eval(rc.logits);
+                    std::cerr << "[graph] eval recorded; end_capture" << std::endl;
+                    bool _ok = gpu::gpu_graph_end_capture();
+                    std::cerr << "[graph] end_capture=" << _ok << "; replay" << std::endl;
+                    if (_ok) {
+                        g_logits = rc.logits;
+                        state_ = rc.state;
+                        g_captured = true;
+                        gpu::gpu_graph_replay(); // execute this captured step
+                        std::cerr << "[graph] captured decode step; replaying per token"
+                                  << std::endl;
+                        return convert_to_token(g_logits);
+                    }
+                    gpu::gpu_graph_reset();
+                }
+                // else: warmup -> fall through to normal path below
+            } else {
+                write_token();
+                auto t0 = std::chrono::steady_clock::now();
+                gpu::gpu_graph_replay();
+                auto t1 = std::chrono::steady_clock::now();
+                g_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+                if (++g_n % 64 == 0)
+                    std::cerr << "[graph] replay avg " << (g_ms / g_n) << " ms ("
+                              << (1000.0 * g_n / g_ms) << " tok/s)" << std::endl;
+                return convert_to_token(g_logits);
+            }
         }
     }
 #endif
