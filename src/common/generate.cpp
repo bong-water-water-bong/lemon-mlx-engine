@@ -25,6 +25,7 @@ namespace mlx::core {
   bool gpu_graph_begin_capture();
   bool gpu_graph_end_capture();
   bool gpu_graph_replay();
+  bool gpu_graph_replay_async();
   void gpu_graph_reset();
   bool gpu_graph_available();
 }
@@ -528,7 +529,7 @@ mx::array TokenIterator::step(const LMInput::Text& previous) {
                         g_logits = rc.logits;
                         state_ = rc.state;
                         g_captured = true;
-                        gpu::gpu_graph_replay(); // execute this captured step
+                        gpu::gpu_graph_replay(); // execute this captured step (sync)
                         std::cerr << "[graph] captured decode step; replaying per token"
                                   << std::endl;
                         return convert_to_token(g_logits);
@@ -537,15 +538,25 @@ mx::array TokenIterator::step(const LMInput::Text& previous) {
                 }
                 // else: warmup -> fall through to normal path below
             } else {
+                // Async replay by default: launch the graph onto the generation
+                // stream WITHOUT draining, then let convert_to_token's sampling
+                // ops queue right after it on the same stream (the .item() that
+                // reads the token is the single sync point). This restores the
+                // cross-token pipelining a per-token hipStreamSynchronize would
+                // kill. MLX_GRAPH_SYNC=1 forces the old blocking replay for A/B.
+                static const bool g_sync = std::getenv("MLX_GRAPH_SYNC") != nullptr;
                 write_token();
                 auto t0 = std::chrono::steady_clock::now();
-                gpu::gpu_graph_replay();
+                if (g_sync) gpu::gpu_graph_replay();
+                else        gpu::gpu_graph_replay_async();
+                auto tok = convert_to_token(g_logits);
+                mx::eval(tok);  // force the per-token sync here so timing is honest
                 auto t1 = std::chrono::steady_clock::now();
                 g_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
                 if (++g_n % 64 == 0)
-                    std::cerr << "[graph] replay avg " << (g_ms / g_n) << " ms ("
+                    std::cerr << "[graph] per-token avg " << (g_ms / g_n) << " ms ("
                               << (1000.0 * g_n / g_ms) << " tok/s)" << std::endl;
-                return convert_to_token(g_logits);
+                return tok;
             }
         }
     }
