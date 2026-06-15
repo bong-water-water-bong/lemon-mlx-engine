@@ -784,6 +784,17 @@ std::vector<int> TokenIterator::mtp_speculative_step() {
     }
 
     MTPHead* mtp_head = static_cast<MTPHead*>(context_.get_mtp_head_fn());
+    // get_mtp_head_fn is a valid callback even when the model carries no MTP
+    // head weights (mtp_weights_ empty -> build_mtp_head() never ran), in which
+    // case it returns nullptr. Dereferencing it in the draft loop below
+    // segfaults for any n_draft>1. Fall back to plain decode instead of crashing
+    // when --use-mtp is requested on a model without an MTP head.
+    if (mtp_head == nullptr) {
+        auto token = step(y_);
+        y_ = LMInput::Text(token);
+        mx::eval(token);
+        return {token.item<int32_t>()};
+    }
     int n_draft = current_draft_count();
     static const bool kMtpTiming = (std::getenv("MTP_TIMING") != nullptr);
     auto t_start = std::chrono::steady_clock::now();
