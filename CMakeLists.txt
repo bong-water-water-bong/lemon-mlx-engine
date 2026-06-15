@@ -230,6 +230,11 @@ if(MLX_LM_BUILD_EXAMPLES)
     add_executable(diagnose examples/diagnose.cpp)
     target_link_libraries(diagnose PRIVATE mlx-lm-llm mlx-lm-common mlx-lm-core)
 
+    # convert: quantize a bf16 Qwen3.6-A3B (+ inline MTP head) to a combined MLX
+    # model with per-component mixed precision. Uses the engine's own MLX build.
+    add_executable(convert examples/convert.cpp)
+    target_link_libraries(convert PRIVATE mlx-lm-llm mlx-lm-common mlx-lm-core)
+
     add_executable(test_gdn examples/test_gdn.cpp)
     target_link_libraries(test_gdn PRIVATE mlx)
 
