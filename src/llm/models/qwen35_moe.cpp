@@ -202,39 +202,6 @@ static bool fuse_quant_projections(
     return true;
 }
 
-// Device-offset NeoX RoPE for x [B, H, L, D]: the position lives in a DEVICE
-// array (`pos`, the absolute index of the first of the L tokens) instead of a
-// host int, so it can advance per HIP-graph replay. Numerically identical to
-// mx::fast::rope(x, dims, false, base, scale, offset) (validated to ~1e-6). Used
-// on the graph-decode path (MLX_DECODE_DEVICE_POS); the default path keeps
-// mx::fast::rope. See examples/test_device_rope.cpp.
-static mx::array device_rope(const mx::array& x, const mx::array& pos, int dims,
-                             float base, float scale) {
-    int D = x.shape(-1), L = x.shape(-2), half = dims / 2;
-    auto i = mx::arange(0, half, mx::float32);
-    auto inv_freq = mx::exp(mx::multiply(
-        i, mx::array(-std::log(base) * 2.0f / dims)));
-    auto p = mx::add(mx::astype(pos, mx::float32),
-                     mx::astype(mx::arange(0, L, mx::int32), mx::float32));
-    p = mx::multiply(p, mx::array(scale));
-    auto theta = mx::multiply(mx::expand_dims(p, 1), mx::expand_dims(inv_freq, 0));
-    auto cos = mx::reshape(mx::cos(theta), {1, 1, L, half});
-    auto sin = mx::reshape(mx::sin(theta), {1, 1, L, half});
-    auto rot = mx::slice(x, {0, 0, 0, 0}, {x.shape(0), x.shape(1), L, dims});
-    auto x1 = mx::slice(rot, {0, 0, 0, 0}, {rot.shape(0), rot.shape(1), L, half});
-    auto x2 = mx::slice(rot, {0, 0, 0, half}, {rot.shape(0), rot.shape(1), L, dims});
-    auto out = mx::concatenate(
-        {mx::subtract(mx::multiply(x1, cos), mx::multiply(x2, sin)),
-         mx::add(mx::multiply(x2, cos), mx::multiply(x1, sin))}, -1);
-    if (dims < D)
-        out = mx::concatenate(
-            {out, mx::slice(x, {0, 0, 0, dims}, {x.shape(0), x.shape(1), L, D})}, -1);
-    // Preserve the input dtype: the cos/sin multiply promotes to float32, but the
-    // rest of the pipeline (and the KV cache buffer) is bf16 — returning float32
-    // would corrupt the cache. fast::rope preserves dtype, so match it.
-    return mx::astype(out, x.dtype());
-}
-
 // --- Qwen35MoEAttention ---
 // Swift: Qwen35Attention -- standard attention with sigmoid gate on q_proj output
 
@@ -316,8 +283,8 @@ mx::array Qwen35MoEAttention::operator()(const mx::array& x,
     static const bool g_devpos = std::getenv("MLX_DECODE_DEVICE_POS") != nullptr;
     if (g_devpos) {
         auto pos = mx::array({offset}, {1}, mx::int32);
-        queries = device_rope(queries, pos, rope_dims_, rope_theta_, 1.0f);
-        keys = device_rope(keys, pos, rope_dims_, rope_theta_, 1.0f);
+        queries = mx::fast::rope(queries, rope_dims_, false, rope_theta_, 1.0f, pos);
+        keys = mx::fast::rope(keys, rope_dims_, false, rope_theta_, 1.0f, pos);
     } else {
         queries = mx::fast::rope(queries, rope_dims_, false, rope_theta_, 1.0f, offset);
         keys = mx::fast::rope(keys, rope_dims_, false, rope_theta_, 1.0f, offset);
@@ -326,19 +293,12 @@ mx::array Qwen35MoEAttention::operator()(const mx::array& x,
     // KV cache update + SDPA.
     mx::array output(0.0f);
     if (g_devpos && L == 1 && cache) {
-        // Write-free graph-decode forward. Read the PAST KV from the persistent
-        // fixed-CAP buffer (read-only), CONCAT the current token's k/v (fresh),
-        // attend with a DEVICE-position additive mask. NO in-place write inside
-        // the forward -> capture-safe (an in-place KV write self-aliases and
-        // deadlocks under HIP-graph capture). Constant shapes ([CAP+1]) and
-        // numerically identical to write-then-read (masked positions contribute
-        // exp(-inf)=0). The append below is eager here; the graph harness lifts it
-        // OUT of the captured region (external append between replays).
-        auto st = cache->state();          // past KV [B,H,CAP,D], valid [0:offset)
+        // Write-free graph-decode forward: read the fixed-CAP KV buffer, concat
+        // the current token, attend with a device-position mask. No in-place
+        // write (self-aliases under capture). Append is eager; the graph harness
+        // lifts it out (external append between replays).
+        auto st = cache->state();
         if (st.size() < 2) {
-            // Cache not yet populated (e.g. the very first decode after an empty
-            // prefill on this layer): no past, so write the token and attend over
-            // the single populated slot (the write-then-read step-2 form).
             cache->update(keys, values);
             auto st2 = cache->state();
             const auto& fk = st2[0];
@@ -376,7 +336,7 @@ mx::array Qwen35MoEAttention::operator()(const mx::array& x,
                         {1, 1, 1, CAP + 1}),
             x.dtype());
         output = sdpa(queries, k_all, v_all, scale_, AttentionMask::from_array(addmask));
-        cache->update(keys, values);       // append for next step (harness moves out)
+        if (!std::getenv("MLX_GRAPH_NO_APPEND")) cache->update(keys, values);
     } else {
         if (cache) {
             auto [k, v] = cache->update(keys, values);
