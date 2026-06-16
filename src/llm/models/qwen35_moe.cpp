@@ -326,25 +326,57 @@ mx::array Qwen35MoEAttention::operator()(const mx::array& x,
     // KV cache update + SDPA.
     mx::array output(0.0f);
     if (g_devpos && L == 1 && cache) {
-        // Graph-decode path: write the new token into the static KV in place,
-        // then read the FULL fixed-CAP buffer and attend with a DEVICE-position
-        // additive mask (0 for j<=pos, -inf beyond). Constant shapes across
-        // decode steps (capturable), and numerically identical to reading
-        // [0:offset] since masked positions contribute exp(-inf)=0. pos is the
-        // just-written token's index (offset-1).
-        cache->update(keys, values);
-        auto st = cache->state();          // {full keys, full values} = [B,H,CAP,D]
-        const auto& fk = st[0];
-        const auto& fv = st[1];
-        int CAP = fk.shape(2);
-        auto cols = mx::arange(0, CAP, mx::int32);
-        auto pos = mx::array({cache->offset() - 1}, {1}, mx::int32);
+        // Write-free graph-decode forward. Read the PAST KV from the persistent
+        // fixed-CAP buffer (read-only), CONCAT the current token's k/v (fresh),
+        // attend with a DEVICE-position additive mask. NO in-place write inside
+        // the forward -> capture-safe (an in-place KV write self-aliases and
+        // deadlocks under HIP-graph capture). Constant shapes ([CAP+1]) and
+        // numerically identical to write-then-read (masked positions contribute
+        // exp(-inf)=0). The append below is eager here; the graph harness lifts it
+        // OUT of the captured region (external append between replays).
+        auto st = cache->state();          // past KV [B,H,CAP,D], valid [0:offset)
+        if (st.size() < 2) {
+            // Cache not yet populated (e.g. the very first decode after an empty
+            // prefill on this layer): no past, so write the token and attend over
+            // the single populated slot (the write-then-read step-2 form).
+            cache->update(keys, values);
+            auto st2 = cache->state();
+            const auto& fk = st2[0];
+            const auto& fv = st2[1];
+            int CAP2 = fk.shape(2);
+            auto cols2 = mx::arange(0, CAP2, mx::int32);
+            auto pos2 = mx::array({cache->offset() - 1}, {1}, mx::int32);
+            auto m2 = mx::astype(
+                mx::reshape(mx::where(mx::less_equal(cols2, pos2), mx::array(0.0f),
+                                      mx::array(-std::numeric_limits<float>::infinity())),
+                            {1, 1, 1, CAP2}),
+                x.dtype());
+            output = sdpa(queries, fk, fv, scale_, AttentionMask::from_array(m2));
+            output = mx::reshape(mx::transpose(output, {0, 2, 1, 3}), {B, L, -1});
+            static auto compiled_gate0 = mx::compile(
+                [](const std::vector<mx::array>& in) -> std::vector<mx::array> {
+                    return {mx::multiply(in[0], mx::sigmoid(in[1]))}; },
+                /*shapeless=*/true);
+            return linear_fwd(compiled_gate0({output, gate})[0], o_proj_weight_,
+                              o_proj_bias_);
+        }
+        const auto& past_k = st[0];
+        const auto& past_v = st[1];
+        int CAP = past_k.shape(2);
+        auto k_all = mx::concatenate({past_k, keys}, 2);    // [B,H,CAP+1,D]
+        auto v_all = mx::concatenate({past_v, values}, 2);
+        auto cols = mx::arange(0, CAP + 1, mx::int32);
+        auto pos = mx::array({cache->offset()}, {1}, mx::int32);  // N past tokens
+        // valid = past index in [0,N)  OR  the appended current token (last slot)
+        auto valid = mx::logical_or(mx::less(cols, pos),
+                                    mx::equal(cols, mx::array(CAP, mx::int32)));
         auto addmask = mx::astype(
-            mx::reshape(mx::where(mx::less_equal(cols, pos), mx::array(0.0f),
+            mx::reshape(mx::where(valid, mx::array(0.0f),
                                   mx::array(-std::numeric_limits<float>::infinity())),
-                        {1, 1, 1, CAP}),
+                        {1, 1, 1, CAP + 1}),
             x.dtype());
-        output = sdpa(queries, fk, fv, scale_, AttentionMask::from_array(addmask));
+        output = sdpa(queries, k_all, v_all, scale_, AttentionMask::from_array(addmask));
+        cache->update(keys, values);       // append for next step (harness moves out)
     } else {
         if (cache) {
             auto [k, v] = cache->update(keys, values);
