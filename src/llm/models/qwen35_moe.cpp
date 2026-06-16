@@ -201,6 +201,39 @@ static bool fuse_quant_projections(
     return true;
 }
 
+// Device-offset NeoX RoPE for x [B, H, L, D]: the position lives in a DEVICE
+// array (`pos`, the absolute index of the first of the L tokens) instead of a
+// host int, so it can advance per HIP-graph replay. Numerically identical to
+// mx::fast::rope(x, dims, false, base, scale, offset) (validated to ~1e-6). Used
+// on the graph-decode path (MLX_DECODE_DEVICE_POS); the default path keeps
+// mx::fast::rope. See examples/test_device_rope.cpp.
+static mx::array device_rope(const mx::array& x, const mx::array& pos, int dims,
+                             float base, float scale) {
+    int D = x.shape(-1), L = x.shape(-2), half = dims / 2;
+    auto i = mx::arange(0, half, mx::float32);
+    auto inv_freq = mx::exp(mx::multiply(
+        i, mx::array(-std::log(base) * 2.0f / dims)));
+    auto p = mx::add(mx::astype(pos, mx::float32),
+                     mx::astype(mx::arange(0, L, mx::int32), mx::float32));
+    p = mx::multiply(p, mx::array(scale));
+    auto theta = mx::multiply(mx::expand_dims(p, 1), mx::expand_dims(inv_freq, 0));
+    auto cos = mx::reshape(mx::cos(theta), {1, 1, L, half});
+    auto sin = mx::reshape(mx::sin(theta), {1, 1, L, half});
+    auto rot = mx::slice(x, {0, 0, 0, 0}, {x.shape(0), x.shape(1), L, dims});
+    auto x1 = mx::slice(rot, {0, 0, 0, 0}, {rot.shape(0), rot.shape(1), L, half});
+    auto x2 = mx::slice(rot, {0, 0, 0, half}, {rot.shape(0), rot.shape(1), L, dims});
+    auto out = mx::concatenate(
+        {mx::subtract(mx::multiply(x1, cos), mx::multiply(x2, sin)),
+         mx::add(mx::multiply(x2, cos), mx::multiply(x1, sin))}, -1);
+    if (dims < D)
+        out = mx::concatenate(
+            {out, mx::slice(x, {0, 0, 0, dims}, {x.shape(0), x.shape(1), L, D})}, -1);
+    // Preserve the input dtype: the cos/sin multiply promotes to float32, but the
+    // rest of the pipeline (and the KV cache buffer) is bf16 — returning float32
+    // would corrupt the cache. fast::rope preserves dtype, so match it.
+    return mx::astype(out, x.dtype());
+}
+
 // --- Qwen35MoEAttention ---
 // Swift: Qwen35Attention -- standard attention with sigmoid gate on q_proj output
 
@@ -276,10 +309,18 @@ mx::array Qwen35MoEAttention::operator()(const mx::array& x,
         {0, 2, 1, 3});
     values = mx::transpose(mx::reshape(values, {B, L, num_kv_heads_, -1}), {0, 2, 1, 3});
 
-    // RoPE with partial rotary factor
+    // RoPE with partial rotary factor. MLX_DECODE_DEVICE_POS uses the
+    // device-position RoPE (graph-decode path); the default keeps fast::rope.
     int offset = cache ? cache->offset() : 0;
-    queries = mx::fast::rope(queries, rope_dims_, false, rope_theta_, 1.0f, offset);
-    keys = mx::fast::rope(keys, rope_dims_, false, rope_theta_, 1.0f, offset);
+    static const bool g_devpos = std::getenv("MLX_DECODE_DEVICE_POS") != nullptr;
+    if (g_devpos) {
+        auto pos = mx::array({offset}, {1}, mx::int32);
+        queries = device_rope(queries, pos, rope_dims_, rope_theta_, 1.0f);
+        keys = device_rope(keys, pos, rope_dims_, rope_theta_, 1.0f);
+    } else {
+        queries = mx::fast::rope(queries, rope_dims_, false, rope_theta_, 1.0f, offset);
+        keys = mx::fast::rope(keys, rope_dims_, false, rope_theta_, 1.0f, offset);
+    }
 
     // KV cache update
     if (cache) {
