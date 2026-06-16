@@ -238,6 +238,12 @@ if(MLX_LM_BUILD_EXAMPLES)
     add_executable(test_gdn examples/test_gdn.cpp)
     target_link_libraries(test_gdn PRIVATE mlx)
 
+    add_executable(test_device_kv examples/test_device_kv.cpp)
+    target_link_libraries(test_device_kv PRIVATE mlx)
+
+    add_executable(test_device_rope examples/test_device_rope.cpp)
+    target_link_libraries(test_device_rope PRIVATE mlx)
+
     add_executable(test_qbits examples/test_qbits.cpp)
     target_link_libraries(test_qbits PRIVATE mlx)
 
@@ -245,6 +251,10 @@ if(MLX_LM_BUILD_EXAMPLES)
     # (mlx::core::gpu_graph_*/gpu_arena_*), which only exist in the ROCm backend.
     # Building it on CPU/macOS fails to link, so gate it on the ROCm backend.
     if(MLX_BUILD_ROCM)
+        add_executable(test_graph_kv_advance examples/test_graph_kv_advance.cpp)
+        target_link_libraries(test_graph_kv_advance PRIVATE mlx)
+        target_compile_definitions(test_graph_kv_advance PRIVATE MLX_BUILD_ROCM)
+
         add_executable(graph_probe examples/graph_probe.cpp)
         target_link_libraries(graph_probe PRIVATE mlx)
     endif()
