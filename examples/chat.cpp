@@ -21,13 +21,6 @@ namespace mx = mlx::core;
 // or more GPUs. Listing shells out to rocm-smi to avoid a HIP header dependency
 // in this host-only example.
 static void select_or_list_gpu(int argc, char* argv[]) {
-    // Let each GPU report its TRUE arch. A global HSA_OVERRIDE_GFX_VERSION
-    // (e.g. 11.5.1 for a gfx1151 APU, often set in a shell profile) would force
-    // a discrete gfx1201 GPU to also masquerade as gfx1151 — the runtime then
-    // runs gfx1151 ISA on RDNA4 silicon and faults. Unsetting it makes the APU
-    // report gfx1151 and the R9700 report gfx1201, so both work and auto-detect.
-    unsetenv("HSA_OVERRIDE_GFX_VERSION");
-
     bool list = false;
     int device = -1;
     for (int i = 1; i < argc; i++) {
@@ -50,10 +43,11 @@ static void select_or_list_gpu(int argc, char* argv[]) {
         std::exit(0);
     }
     if (device >= 0) {
-        // Must be set before the HIP runtime initializes (first HIP call).
-        setenv("HIP_VISIBLE_DEVICES", std::to_string(device).c_str(), 1);
-        std::cerr << "Selecting GPU index " << device
-                  << " (HIP_VISIBLE_DEVICES=" << device << ")\n";
+        // Bind the chosen GPU via the MLX device index (hipSetDevice under the
+        // hood) instead of masking with HIP_VISIBLE_DEVICES — the env approach
+        // is timing-fragile (MLX can grab device 0 before the mask applies).
+        mx::set_default_device(mx::Device(mx::Device::gpu, device));
+        std::cerr << "Selecting GPU device index " << device << "\n";
     }
 }
 
