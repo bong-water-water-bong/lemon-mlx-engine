@@ -11,6 +11,10 @@ on:
         required: false
         default: true
         type: boolean
+      hip_device:
+        description: 'Override HIP device index for the GPU smoke test (blank = use the per-matrix default)'
+        required: false
+        default: ''
 
   pull_request:
     types: [opened, synchronize, reopened]
@@ -304,6 +308,7 @@ jobs:
             artifact: mlx-engine-ubuntu-rocm-x64
             runs_on: '["self-hosted", "Linux", "X64", "gfx1151"]'
             install_rocm: true
+            hip_device: 0          # gfx1151 APU (HIP device 0); R9700 is device 1
             model: mlx-community/Qwen3.5-0.8B-4bit
             use_mtp: false
             no_think: false
@@ -311,6 +316,7 @@ jobs:
             artifact: mlx-engine-ubuntu-rocm-x64
             runs_on: '["self-hosted", "Linux", "X64", "gfx1151"]'
             install_rocm: true
+            hip_device: 0          # gfx1151 APU (HIP device 0); R9700 is device 1
             model: mlx-community/Qwen3.5-4B-MTP-4bit
             use_mtp: true
             no_think: true
@@ -402,6 +408,26 @@ jobs:
         else
           echo "Memory OK for MTP test"
         fi
+
+    - name: Select GPU device (pin smoke test to the matrix gfx card)
+      if: matrix.install_rocm
+      run: |
+        # The self-hosted gfx1151 runner has two AMD GPUs: the gfx1151 APU
+        # (HIP device 0, unified memory) and a gfx1201 R9700 (HIP device 1).
+        # Without an explicit pin the server can initialize on the wrong card —
+        # and with a global HSA_OVERRIDE_GFX_VERSION the R9700 masquerades as
+        # gfx1151 and runs the wrong ISA (garbage output / failed inference).
+        # Pin HIP_VISIBLE_DEVICES to this matrix entry's device. Override with
+        # the workflow_dispatch 'hip_device' input.
+        dev="${{ matrix.hip_device }}"
+        override="${{ github.event.inputs.hip_device }}"
+        [ -n "$override" ] && dev="$override"
+        [ -z "$dev" ] && dev=0
+        echo "HIP_VISIBLE_DEVICES=$dev" >> "$GITHUB_ENV"
+        echo "Pinned smoke test to HIP_VISIBLE_DEVICES=$dev"
+        # Best-effort log of the visible GPUs for diagnosis.
+        chmod +x mlx-binaries/chat 2>/dev/null || true
+        mlx-binaries/chat --list-devices 2>/dev/null || true
 
     - name: 'Smoke test: server start and health'
       run: |
