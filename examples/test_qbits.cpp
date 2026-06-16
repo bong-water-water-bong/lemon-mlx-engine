@@ -37,11 +37,33 @@ int main() {
               << (r > 0.05f ? "   *** GARBAGE ***" : "   ok") << "\n";
   }
 
-  // NOTE: the MoE gather_qmm path is exercised in-situ by the model itself
-  // (the 256-expert MoE coheres at 4/6/8-bit), which is the authoritative check.
-  // A standalone gather_qmm micro-test is omitted here to avoid mis-wiring its
-  // index/transpose semantics (which is easy to get wrong and produces a
-  // misleading failure that isn't a kernel bug).
+  // 3D gather_qmm (MoE decode path, M=1). Reference via take + batched matmul
+  // (unambiguous). Set MLX_ROCM_GATHER_QMV_USE_TILED=1 to route 4/8-bit through
+  // the tiled gather kernel; this test guards its correctness vs warp-shared.
+  std::cout << "\n=== gather_qmm, bf16, M=1 decode (MoE expert path) ===\n";
+  std::cout << "w=[E=8,N=512,K=2048], B=16 (token,expert) pairs, M=1\n";
+  for (int bits : {4, 6, 8}) {
+    int E = 8, B = 16, N = 512, K = 2048;
+    auto W = mx::astype(mx::random::normal({E, N, K}, mx::float32), mx::bfloat16);
+    auto x = mx::astype(mx::random::normal({B, 1, K}, mx::float32), mx::bfloat16);
+    mx::eval({W, x});
+    auto q = mx::quantize(W, gs, bits);
+    auto lhs = mx::arange(0, B, mx::uint32);              // identity (each batch its own x)
+    auto rhs = mx::astype(mx::remainder(mx::arange(0, B, mx::int32),
+                                        mx::array(E)), mx::uint32);  // expert per batch
+    mx::eval({lhs, rhs});
+    auto wdeq = mx::dequantize(q[0], q[1], q[2], gs, bits);          // [E,N,K]
+    auto wg = mx::take(wdeq, rhs, 0);                                // [B,N,K]
+    auto ref = mx::matmul(x, mx::swapaxes(wg, -1, -2));              // [B,1,N]
+    auto gpu = mx::gather_qmm(x, q[0], q[1], q[2], lhs, rhs,
+                              /*transpose=*/true, gs, bits);         // [B,1,N]
+    mx::eval({ref, gpu});
+    float r = rel_err(ref, gpu);
+    std::cout << "  bits=" << bits << "  ref=" << ref.shape(0) << "x" << ref.shape(2)
+              << "  gpu=" << gpu.shape(0) << "x" << gpu.shape(2)
+              << "  rel_err=" << std::scientific << r
+              << (r > 0.05f ? "   *** GARBAGE ***" : "   ok") << "\n";
+  }
 
   std::cout << "\n=== Done ===\n";
   return 0;

@@ -251,6 +251,10 @@ if(MLX_LM_BUILD_EXAMPLES)
     # (mlx::core::gpu_graph_*/gpu_arena_*), which only exist in the ROCm backend.
     # Building it on CPU/macOS fails to link, so gate it on the ROCm backend.
     if(MLX_BUILD_ROCM)
+        add_executable(test_graph_counter examples/test_graph_counter.cpp)
+        target_link_libraries(test_graph_counter PRIVATE mlx)
+        target_compile_definitions(test_graph_counter PRIVATE MLX_BUILD_ROCM)
+
         add_executable(test_graph_kv_advance examples/test_graph_kv_advance.cpp)
         target_link_libraries(test_graph_kv_advance PRIVATE mlx)
         target_compile_definitions(test_graph_kv_advance PRIVATE MLX_BUILD_ROCM)
