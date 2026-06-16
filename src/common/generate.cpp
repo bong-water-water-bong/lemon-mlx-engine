@@ -845,24 +845,60 @@ std::vector<int> TokenIterator::mtp_speculative_step() {
     std::vector<int> draft_tokens;
     draft_tokens.reserve(n_draft);
 
-    int prev_token = y_.tokens.item<int32_t>();
-    draft_tokens.push_back(prev_token);  // d0 = y_ (trunk's confirmed next token)
+    // Keep the draft recurrence ON-DEVICE. d0 is the trunk's confirmed next
+    // token (y_); each subsequent draft d_i = argmax(head output after feeding
+    // embed(d_{i-1})). Previously every draft did a BLOCKING .item() to read the
+    // argmax back to host so it could rebuild embed(prev) — that serialized the
+    // whole draft chain behind n_draft-1 full GPU syncs. Instead we keep each
+    // argmax as a [1,1] int32 array and feed it straight into embed_fn (which
+    // does mx::take on the embedding table), so the next draft's embedding
+    // depends on this draft's argmax entirely on-device with no host round-trip.
+    // We sync ONCE after the chain to read all draft token ids together.
+    //
+    // d0 (= y_.tokens) stays a [1,1] int32 array; never .item()'d here.
+    auto prev_tok_arr = mx::reshape(y_.tokens, {1, 1});  // [1,1] int32, d0
+    std::vector<mx::array> draft_tok_arrs;               // d1..d_{n-1}, on-device
+    draft_tok_arrs.reserve(n_draft > 1 ? n_draft - 1 : 0);
 
     for (int i = 1; i < n_draft; ++i) {
         // Run the MTP decoder layer with the previous token's embedding to
-        // advance the hidden state, THEN predict this draft token.
-        auto prev_embed = context_.embed_fn(mx::array({prev_token}, {1, 1}, mx::int32));
+        // advance the hidden state, THEN predict this draft token. prev_tok_arr
+        // is the on-device argmax of the previous draft (or d0 for i==1); feeding
+        // it to embed_fn does mx::take directly, no host round-trip.
+        auto prev_embed = context_.embed_fn(prev_tok_arr);
         hidden = (*mtp_head)(hidden, prev_embed, AttentionMask{},
                             mtp_caches_.empty() ? nullptr : &mtp_caches_[0]);
 
         auto norm_h = mtp_head->apply_output_norm(hidden);
         auto logits = context_.apply_lm_head_fn(norm_h);
-        prev_token = mx::argmax(logits, -1).item<int32_t>();
-        draft_tokens.push_back(prev_token);
+        // argmax stays on-device as a [1,1] int32 array; it is BOTH this draft's
+        // token id AND the next draft's embedding input. No .item() here.
+        prev_tok_arr = mx::reshape(
+            mx::argmax(logits, -1, /*keepdims=*/false), {1, 1});
+        prev_tok_arr = mx::astype(prev_tok_arr, mx::int32);
+        draft_tok_arrs.push_back(prev_tok_arr);
         // NOTE: do NOT mx::clear_cache() here. Freeing the whole buffer pool
         // after every draft forces the next draft (and the verify) to re-allocate
         // from the driver, adding ms of overhead inside the speculative hot loop.
         // The main generation loop already clears periodically (every 256 tokens).
+    }
+
+    // Single sync for the whole draft chain: concatenate d1..d_{n-1} (if any)
+    // into one [n_draft-1] array, eval once, then read the host ints together.
+    // d0 is read from y_.tokens in the same eval. This is the ONLY host sync in
+    // the draft phase (was n_draft-1 separate .item() syncs before).
+    if (!draft_tok_arrs.empty()) {
+        auto drafts_dev = mx::reshape(
+            mx::concatenate(draft_tok_arrs, /*axis=*/0),
+            {static_cast<int>(draft_tok_arrs.size())});
+        mx::eval(y_.tokens, drafts_dev);
+        draft_tokens.push_back(y_.tokens.item<int32_t>());  // d0
+        for (size_t i = 0; i < draft_tok_arrs.size(); ++i) {
+            draft_tokens.push_back(drafts_dev.data<int32_t>()[i]);
+        }
+    } else {
+        mx::eval(y_.tokens);
+        draft_tokens.push_back(y_.tokens.item<int32_t>());  // d0 only
     }
     if (kMtpTiming) t_draft = std::chrono::steady_clock::now();
 
@@ -926,14 +962,23 @@ std::vector<int> TokenIterator::mtp_speculative_step() {
     // Since draft[i] is at position P+i, logits[0, i, :] predicts position P+i+1.
     // So we compare logit[i] vs draft[i+1] (not draft[i]).
     // Note: draft[0] is not verified — it's trusted from the MTP head.
+    //
+    // Vectorize: take argmax over the WHOLE [1, n_draft, vocab] logits in ONE op
+    // -> [1, n_draft] (the trunk's predicted token at every draft position,
+    // including the bonus slot n_draft-1), eval once, and read all n_draft host
+    // ints together. Previously this was a per-draft mx::argmax(...).item() loop
+    // plus a separate argmax for the bonus token — n_draft total blocking syncs.
+    // Now it is exactly ONE sync; the accept/mismatch scan runs on host ints.
     auto logits = result.logits;
+    // argmax returns uint32 indices; cast to int32 so data<int32_t>() reads the
+    // token ids directly (token ids are < 2^31 so this is value-preserving).
+    auto trunk_argmax = mx::astype(mx::argmax(logits, -1), mx::int32);  // [1, n_draft]
+    mx::eval(trunk_argmax);
+    const int32_t* trunk_pred = trunk_argmax.data<int32_t>();
+
     int accepted = 0;
-
     for (int i = 0; i < n_draft - 1; ++i) {
-        auto logit_i = mx::slice(logits, {0, i, 0}, {1, i + 1, static_cast<int>(logits.shape(2))});
-        logit_i = mx::squeeze(logit_i, 1);
-        auto trunk_token = mx::argmax(logit_i, -1).item<int32_t>();
-
+        int32_t trunk_token = trunk_pred[i];
         if (trunk_token == draft_tokens[i + 1]) {
             accepted++;
         } else {
@@ -948,10 +993,9 @@ std::vector<int> TokenIterator::mtp_speculative_step() {
     // accepted is the number of drafts verified (excluding d0).
     // Total emitted = 1 (d0) + accepted (verified d1...d_{accepted}).
     if (accepted == n_draft - 1) {
-        // All verifiable drafts accepted — get bonus token from the trunk's last logit.
-        auto bonus_logit = mx::slice(logits, {0, n_draft - 1, 0}, {1, n_draft, static_cast<int>(logits.shape(2))});
-        bonus_logit = mx::squeeze(bonus_logit, 1);
-        int bonus_token = mx::argmax(bonus_logit, -1).item<int32_t>();
+        // All verifiable drafts accepted — bonus token is the trunk's prediction
+        // at the last draft position (already in trunk_pred, no extra argmax).
+        int32_t bonus_token = trunk_pred[n_draft - 1];
         y_ = LMInput::Text(mx::array({bonus_token}, {1}, mx::int32));
     } else {
         // Mismatch at position `accepted+1`. draft_tokens[accepted+1] was already
@@ -1043,8 +1087,11 @@ std::vector<int> TokenIterator::mtp_speculative_step() {
     record_acceptance(n_draft, accepted);
 
     // Update MTP metrics counters.
+    // Only n_draft-1 tokens are actually drafted+verified by the MTP head; d0 is
+    // the trunk's own confirmed token (always emitted, never a "draft"). Counting
+    // it would understate acceptance by a factor of (n_draft-1)/n_draft.
     mtp_speculative_steps_++;
-    mtp_draft_proposed_ += n_draft;
+    mtp_draft_proposed_ += (n_draft > 1 ? n_draft - 1 : 1);
     mtp_draft_accepted_ += accepted;
 
     static const bool kMtpDebug = (std::getenv("MTP_DEBUG") != nullptr);
