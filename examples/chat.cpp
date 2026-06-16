@@ -84,6 +84,7 @@ struct CliArgs {
     int n_draft_tokens = 1;
     int device = -1;          // GPU index to use (-1 = auto / default device 0)
     bool list_devices = false;
+    bool ignore_eos = false;  // Benchmark: keep generating to --max-tokens (ignore EOS)
 };
 
 static CliArgs parse_args(int argc, char* argv[]) {
@@ -140,6 +141,8 @@ static CliArgs parse_args(int argc, char* argv[]) {
             args.device = std::stoi(argv[++i]);
         } else if (flag == "--list-devices") {
             args.list_devices = true;
+        } else if (flag == "--ignore-eos") {
+            args.ignore_eos = true;
         }
     }
     return args;
@@ -273,7 +276,7 @@ int main(int argc, char* argv[]) {
                     mlx_lm::LMInput lm_input(token_array);
 
                     std::set<int> eos_set;
-                    if (ctx.eos_token_ids.has_value()) {
+                    if (ctx.eos_token_ids.has_value() && !args.ignore_eos) {
                         for (int id : ctx.eos_token_ids.value()) {
                             eos_set.insert(id);
                         }
