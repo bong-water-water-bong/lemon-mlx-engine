@@ -276,25 +276,6 @@ void MTPHead::load_mtp_weights(
         }
     }
 
-    // Validate MoE weights if MoE layer is active.
-    // Check that key MoE weight arrays have been populated (non-empty shape).
-    if (moe_layer_) {
-        auto moe_wmap = moe_layer_->weight_map();
-        for (const auto& [key, ptr] : moe_wmap) {
-            (void)key; // Used for diagnostics only.
-            // If any MoE weight is still zero-initialized with a large shape,
-            // it likely means the weight was not loaded from the checkpoint.
-            // We log a warning rather than fail — some weights may legitimately
-            // be near-zero after training.
-            if (ptr->shape().size() > 0) {
-                int64_t total_elements = 1;
-                for (auto s : ptr->shape()) total_elements *= s;
-                if (total_elements > 1024 && mx::allclose(*ptr, mx::zeros_like(*ptr)).item<bool>()) {
-                    // Potentially unloaded MoE weight.
-                }
-            }
-        }
-    }
 }
 
 }  // namespace mlx_lm
