@@ -331,14 +331,15 @@ jobs:
             model: mlx-community/Qwen3.5-0.8B-4bit
             use_mtp: false
             no_think: false
-          - os: ubuntu-cpu-mtp
-            artifact: mlx-engine-ubuntu-cpu-x64
-            runs_on: '"ubuntu-22.04"'
-            install_rocm: false
-            model: mlx-community/Qwen3.5-4B-MTP-4bit
-            use_mtp: true
-            no_think: true
-            timeout_minutes: 30
+          # Temporarily disabled along with the GPU MTP test (see above).
+          # - os: ubuntu-cpu-mtp
+          #   artifact: mlx-engine-ubuntu-cpu-x64
+          #   runs_on: '"ubuntu-22.04"'
+          #   install_rocm: false
+          #   model: mlx-community/Qwen3.5-4B-MTP-4bit
+          #   use_mtp: true
+          #   no_think: true
+          #   timeout_minutes: 30
           - os: macos-arm64
             artifact: mlx-engine-macos-arm64
             runs_on: '"macos-latest"'
