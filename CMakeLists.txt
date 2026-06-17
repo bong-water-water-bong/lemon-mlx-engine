@@ -251,6 +251,9 @@ if(MLX_LM_BUILD_EXAMPLES)
     add_executable(test_dynslice examples/test_dynslice.cpp)
     target_link_libraries(test_dynslice PRIVATE mlx)
 
+    add_executable(test_sdpa_ref examples/test_sdpa_ref.cpp)
+    target_link_libraries(test_sdpa_ref PRIVATE mlx)
+
     # graph_probe exercises the ROCm-only HIP graph capture/replay symbols
     # (mlx::core::gpu_graph_*/gpu_arena_*), which only exist in the ROCm backend.
     # Building it on CPU/macOS fails to link, so gate it on the ROCm backend.
