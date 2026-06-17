@@ -146,6 +146,10 @@ static CliArgs parse_args(int argc, char* argv[]) {
 }
 
 int main(int argc, char* argv[]) {
+    // Unbuffered stdout so generated tokens appear live (not flushed in a block
+    // when piped to a file/pipe).
+    setvbuf(stdout, nullptr, _IONBF, 0);
+
     // Handle --list-devices / --device before anything touches HIP/MLX.
     select_or_list_gpu(argc, argv);
 
