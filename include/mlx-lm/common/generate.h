@@ -334,8 +334,16 @@ private:
     int quantized_kv_start_ = 0;
 
     // Timing.
-    double prompt_prefill_time_ = 0.0;
+    double prompt_prefill_time_ = 0.0;   // host prepare() + GPU prefill exec (first token)
+    double prefill_host_time_ = 0.0;     // host-only portion (graph build / chunk evals)
+    int prompt_token_count_ = 0;
+    bool prefill_measured_ = false;
     std::chrono::steady_clock::time_point generation_start_;
+
+    // Fold the first-token (GPU prefill exec) interval into the prefill time and
+    // restart the generation clock, so prompt_time reflects the true prefill
+    // interval and generation_time is decode-only. Called once, on first token.
+    void measure_prefill_boundary_();
 
     // HIP Graph capture state machine for decode acceleration.
     // After warmup tokens, the decode step has a fixed kernel sequence.

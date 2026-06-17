@@ -731,9 +731,11 @@ TokenIterator::TokenIterator(
         mtp_caches_ = context.new_mtp_cache_fn(params);
         state_ = LMOutput::State();  // Empty state signals model to return hidden
     }
+    prompt_token_count_ = static_cast<int>(input.text.tokens.size());
     prompt_prefill_time_ = measure([&]() {
         prepare(input, params.prefill_step_size);
     });
+    prefill_host_time_ = prompt_prefill_time_;
     generation_start_ = std::chrono::steady_clock::now();
 }
 
@@ -754,9 +756,11 @@ TokenIterator::TokenIterator(
     , use_mtp_(false)  // MTP not supported with explicit cache
     , accept_history_(kAcceptHistorySize, 1)
 {
+    prompt_token_count_ = static_cast<int>(input.text.tokens.size());
     prompt_prefill_time_ = measure([&]() {
         prepare(input, prefill_step_size);
     });
+    prefill_host_time_ = prompt_prefill_time_;
     generation_start_ = std::chrono::steady_clock::now();
 }
 
@@ -787,9 +791,11 @@ TokenIterator::TokenIterator(
         mtp_caches_ = context.new_mtp_cache_fn(params);
         state_ = LMOutput::State();  // Empty state signals model to return hidden
     }
+    prompt_token_count_ = static_cast<int>(input.text.tokens.size());
     prompt_prefill_time_ = measure([&]() {
         prepare(input, params.prefill_step_size);
     });
+    prefill_host_time_ = prompt_prefill_time_;
     generation_start_ = std::chrono::steady_clock::now();
 }
 
@@ -1177,6 +1183,25 @@ int TokenIterator::current_draft_count() const {
 // TokenIterator — next()
 // ---------------------------------------------------------------------------
 
+void TokenIterator::measure_prefill_boundary_() {
+    if (prefill_measured_) {
+        return;
+    }
+    auto now = std::chrono::steady_clock::now();
+    prompt_prefill_time_ += std::chrono::duration<double>(now - generation_start_).count();
+    generation_start_ = now;
+    prefill_measured_ = true;
+    if (std::getenv("MLX_PROFILE_PREFILL")) {
+        double gpu = prompt_prefill_time_ - prefill_host_time_;
+        std::cerr << "[prefill] prompt_tokens=" << prompt_token_count_
+                  << " host_build=" << prefill_host_time_ << "s gpu_exec=" << gpu
+                  << "s total=" << prompt_prefill_time_ << "s pp/s="
+                  << (prompt_prefill_time_ > 0.0
+                          ? prompt_token_count_ / prompt_prefill_time_ : 0.0)
+                  << std::endl;
+    }
+}
+
 std::optional<int> TokenIterator::next() {
     // Check max_tokens limit.
     if (max_tokens_.has_value() && token_count_ >= max_tokens_.value()) {
@@ -1201,6 +1226,7 @@ std::optional<int> TokenIterator::next() {
         auto accepted = mtp_speculative_step();
         token_count_++;
         mx::eval(y_.tokens);
+        measure_prefill_boundary_();
         return accepted.empty() ? std::nullopt : std::optional<int>(accepted[0]);
     }
 
@@ -1211,6 +1237,7 @@ std::optional<int> TokenIterator::next() {
     mx::async_eval(token);
     token_count_++;
     mx::eval(previous_y.tokens);
+    measure_prefill_boundary_();
     return previous_y.tokens.item<int32_t>();
 }
 
@@ -1252,16 +1279,14 @@ GenerateCompletionInfo generate(
     TokenIterator iter(context, input, params);
 
     auto start = std::chrono::steady_clock::now();
-    double prompt_time = 0.0;
     int token_count = 0;
 
     while (auto maybe_token = iter.next()) {
         int token = *maybe_token;
 
-        // Measure prompt time on first token.
+        // Restart the decode clock after the first token (prefill is accounted
+        // for inside the iterator's prompt_prefill_time_).
         if (token_count == 0) {
-            auto now = std::chrono::steady_clock::now();
-            prompt_time = std::chrono::duration<double>(now - start).count();
             start = std::chrono::steady_clock::now();
         }
 
@@ -1294,7 +1319,8 @@ GenerateCompletionInfo generate(
     auto now = std::chrono::steady_clock::now();
     double gen_time = std::chrono::duration<double>(now - start).count();
     info.generation_time = gen_time;
-    info.prompt_time += iter.prompt_prefill_time();
+    // completion_info() already reports the corrected prefill interval
+    // (host prepare + GPU prefill exec); do not add it again.
 
     return info;
 }
