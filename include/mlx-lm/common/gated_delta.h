@@ -34,7 +34,12 @@ std::pair<mlx::core::array, mlx::core::array> gated_delta_ops(
     const mlx::core::array& v, const mlx::core::array& g,
     const mlx::core::array& beta,
     const std::optional<mlx::core::array>& state = std::nullopt,
-    const std::optional<mlx::core::array>& mask = std::nullopt);
+    const std::optional<mlx::core::array>& mask = std::nullopt,
+    // When true, the fused decode kernel writes the new SSM state in place into
+    // the state input's buffer (output aliases input). Required for HIP-graph
+    // replay so the recurrence accumulates; only valid when state is uniquely
+    // owned by the cache (graph decode mode, no MTP snapshot aliasing).
+    bool inplace_state = false);
 
 // Full gated delta update: computes beta, g, initializes state, calls gated_delta_ops.
 std::pair<mlx::core::array, mlx::core::array> gated_delta_update(
@@ -43,7 +48,15 @@ std::pair<mlx::core::array, mlx::core::array> gated_delta_update(
     const mlx::core::array& b, const mlx::core::array& a_log,
     const mlx::core::array& dt_bias,
     const std::optional<mlx::core::array>& state = std::nullopt,
-    const std::optional<mlx::core::array>& mask = std::nullopt);
+    const std::optional<mlx::core::array>& mask = std::nullopt,
+    bool inplace_state = false);
+
+// Write `src` into `dst`'s device buffer IN PLACE; returns an array sharing
+// dst's buffer with src's contents (same total size required). Lets a captured
+// HIP graph update a persistent recurrent-state buffer so the recurrence
+// accumulates across replays (an ordinary reassignment freezes at capture).
+mlx::core::array inplace_write(const mlx::core::array& dst,
+                              const mlx::core::array& src);
 
 // Speculative-decoding variant of gated_delta_ops. In addition to the output and
 // the final state, returns the per-token SSM state STACK `state_seq`

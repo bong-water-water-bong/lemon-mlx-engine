@@ -190,6 +190,26 @@ static mx::fast::CustomKernelFunction make_gdn_kernel() {
         gdn_hip_source);
 }
 
+// In-place variant: state_out (output 1) ALIASES state_in (input 5), so the new
+// recurrent state is written into the SAME buffer it was read from. Safe because
+// the kernel loads the whole state into registers before writing it back. This
+// is what lets a captured HIP graph's gated-delta recurrence accumulate across
+// replays (a fresh output buffer would freeze the state at capture time).
+static mx::fast::CustomKernelFunction make_gdn_kernel_inplace() {
+    return mx::fast::hip_kernel(
+        "gated_delta_step",
+        {"q", "k", "v", "g", "beta", "state_in", "T"},
+        {"y", "state_out"},
+        gdn_hip_source,
+        /*header=*/"", /*ensure_row_contiguous=*/true, /*shared_memory=*/0,
+        /*output_input_aliases=*/{{1, 5}});
+}
+
+static mx::fast::CustomKernelFunction& get_gdn_kernel_inplace() {
+    static auto kernel = make_gdn_kernel_inplace();
+    return kernel;
+}
+
 static mx::fast::CustomKernelFunction make_gdn_seq_kernel() {
     return mx::fast::hip_kernel(
         "gated_delta_step_seq",
@@ -208,20 +228,38 @@ static mx::fast::CustomKernelFunction& get_gdn_kernel() {
     return kernel;
 }
 
+// Copy `src` into `dst`'s buffer IN PLACE: output 0 aliases input 0 (dst). The
+// kernel never reads dst, so this is just an in-place overwrite. Used to update
+// a PERSISTENT recurrent-state buffer (conv_state) so a captured HIP graph's
+// recurrence accumulates across replays instead of freezing at capture.
+static mx::fast::CustomKernelFunction& get_inplace_copy_kernel() {
+    static auto kernel = mx::fast::hip_kernel(
+        "inplace_copy",
+        {"dst", "src"},
+        {"out"},
+        "  unsigned long idx = (unsigned long)blockIdx.x * blockDim.x + threadIdx.x;\n"
+        "  if (idx < (unsigned long)src_shape[0]) { out[idx] = src[idx]; }\n",
+        /*header=*/"", /*ensure_row_contiguous=*/true, /*shared_memory=*/0,
+        /*output_input_aliases=*/{{0, 0}});
+    return kernel;
+}
+
 // ---------------------------------------------------------------------------
 // gatedDeltaKernel — dispatch the fused HIP kernel
 // ---------------------------------------------------------------------------
 static std::pair<mx::array, mx::array> gated_delta_kernel(
     const mx::array& q, const mx::array& k,
     const mx::array& v, const mx::array& g,
-    const mx::array& beta, const mx::array& state)
+    const mx::array& beta, const mx::array& state,
+    bool inplace_state = false)
 {
     int B = k.shape(0), T = k.shape(1);
     int Hk = k.shape(2), Dk = k.shape(3);
     int Hv = v.shape(2), Dv = v.shape(3);
     auto input_type = q.dtype();
 
-    auto results = get_gdn_kernel()(
+    auto& kern = inplace_state ? get_gdn_kernel_inplace() : get_gdn_kernel();
+    auto results = kern(
         {q, k, v, g, beta, state, mx::array(T)},
         {{B, T, Hv, Dv}, state.shape()},
         {input_type, input_type},
@@ -448,7 +486,8 @@ std::pair<mx::array, mx::array> gated_delta_ops(
     const mx::array& v, const mx::array& g,
     const mx::array& beta,
     const std::optional<mx::array>& state,
-    const std::optional<mx::array>& mask)
+    const std::optional<mx::array>& mask,
+    bool inplace_state)
 {
     int B = q.shape(0), T = q.shape(1);
     int Hk = q.shape(2), Dk = q.shape(3);
@@ -462,7 +501,7 @@ std::pair<mx::array, mx::array> gated_delta_ops(
     if (!mask.has_value() && Dk % 32 == 0) {
         auto q_work = repeat_heads(q, repeat_factor);
         auto k_work = repeat_heads(k, repeat_factor);
-        return gated_delta_kernel(q_work, k_work, v, g, beta, s);
+        return gated_delta_kernel(q_work, k_work, v, g, beta, s, inplace_state);
     }
 #endif
 
@@ -521,7 +560,8 @@ std::pair<mx::array, mx::array> gated_delta_update(
     const mx::array& b, const mx::array& a_log,
     const mx::array& dt_bias,
     const std::optional<mx::array>& state,
-    const std::optional<mx::array>& mask)
+    const std::optional<mx::array>& mask,
+    bool inplace_state)
 {
     auto bg = compiled_beta_and_g({b, a_log, a, dt_bias});
     auto& beta = bg[0];
@@ -532,7 +572,23 @@ std::pair<mx::array, mx::array> gated_delta_update(
 
     auto s = state.value_or(mx::zeros({B, Hv, Dv, Dk}, q.dtype()));
 
-    return gated_delta_ops(q, k, v, g, beta, s, mask);
+    return gated_delta_ops(q, k, v, g, beta, s, mask, inplace_state);
+}
+
+// Write src into dst's device buffer IN PLACE; returns an array sharing dst's
+// buffer with src's contents. dst and src must have the same total element count.
+mx::array inplace_write(const mx::array& dst, const mx::array& src) {
+#if defined(MLX_BUILD_ROCM) && MLX_BUILD_ROCM
+    int n = static_cast<int>(src.size());
+    auto dst1 = mx::reshape(dst, {n});
+    auto src1 = mx::reshape(src, {n});
+    auto res = get_inplace_copy_kernel()(
+        {dst1, src1}, {{n}}, {dst.dtype()},
+        {n, 1, 1}, {256, 1, 1}, {}, std::nullopt, true, {});
+    return mx::reshape(res[0], dst.shape());
+#else
+    return src;
+#endif
 }
 
 // ---------------------------------------------------------------------------

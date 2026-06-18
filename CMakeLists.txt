@@ -272,6 +272,14 @@ if(MLX_LM_BUILD_EXAMPLES)
 
         add_executable(graph_probe examples/graph_probe.cpp)
         target_link_libraries(graph_probe PRIVATE mlx)
+
+        add_executable(test_graph_inc examples/test_graph_inc.cpp)
+        target_link_libraries(test_graph_inc PRIVATE mlx)
+        target_compile_definitions(test_graph_inc PRIVATE MLX_BUILD_ROCM)
+
+        add_executable(test_graph_attn examples/test_graph_attn.cpp)
+        target_link_libraries(test_graph_attn PRIVATE mlx)
+        target_compile_definitions(test_graph_attn PRIVATE MLX_BUILD_ROCM)
     endif()
 
     add_executable(server

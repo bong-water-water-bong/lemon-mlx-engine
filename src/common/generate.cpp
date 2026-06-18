@@ -2,6 +2,7 @@
 
 #include <mlx-lm/common/generate.h>
 #include <mlx-lm/common/model_container.h>
+#include <mlx-lm/common/graph_decode.h>
 #include <mlx-lm/llm/models/mtp_head.h>
 #include <mlx/mlx.h>
 #include <algorithm>
@@ -418,6 +419,12 @@ mx::array TokenIterator::step(const LMInput::Text& previous) {
             // by address on replay; freeing them would make replay fault.
             std::vector<KVCache> bench_pinned_cache = cache_;
 
+            // Debug: force live graph_external_pos to isolate whether reading the
+            // persistent graph_decode_pos buffer (vs a frozen host-built pos) wedges.
+            if (std::getenv("MLX_GRAPH_EXT_POS")) {
+                mlx_lm::set_graph_external_pos(true);
+                mlx_lm::set_graph_decode_pos(0);
+            }
             // Capture one step (records all forward + cache-update kernels).
             std::cerr << "[graph-bench] capturing step..." << std::endl;
             gpu::gpu_graph_begin_capture();
@@ -456,131 +463,107 @@ mx::array TokenIterator::step(const LMInput::Text& previous) {
     }
 #endif
 
-    // --- HIP graph replay decode (opt-in via MLX_DECODE_GRAPH) ---
-    // Capture the decode step once after warmup, then replay it per token,
-    // writing the new input token into a fixed buffer that the captured
-    // embedding gather reads. The captured graph holds the KV length/offset from
-    // capture time, so output is only correct while context length matches —
-    // this measures the achievable live graph-replay tok/s; growing-KV
-    // correctness is the next step.
+    // --- HIP-graph decode (ROCm): capture one device-position decode step, then
+    // replay it per token. The position lives in a fixed device buffer the
+    // captured graph reads (RoPE, length mask, KV write); the loop advances it
+    // BETWEEN replays (loop-owned — an in-graph increment would race the readers).
+    // The KV write (slice_update at the device pos) and the gated-delta recurrent
+    // state (in-place custom-kernel output) update fixed buffers in place, so one
+    // captured graph follows the growing context. See HIP_KV_FINDINGS.md.
 #if defined(MLX_BUILD_ROCM)
     {
-        static const bool g_graph = std::getenv("MLX_DECODE_GRAPH") != nullptr;
-        if (g_graph) {
+        static const bool g_graph = graph_decode_enabled();
+        // Decode-only: skip prefill (L>1). The captured graph is a single-token
+        // step, so g_input is [1,1]; engaging on a multi-token prefill would size
+        // g_input wrong and fault the embedding gather. Also requires greedy decode
+        // (no logit processor): the captured graph bakes an argmax, so sampled or
+        // penalty-adjusted decoding falls through to the eager path.
+        int Lstep = batched.tokens.shape(batched.tokens.ndim() - 1);
+        if (g_graph && Lstep == 1 && !cache_.empty() && !processor_.has_value()) {
             namespace gpu = mlx::core;
+            static const bool g_dbg = std::getenv("MLX_GRAPH_DEBUG") != nullptr;
+            static bool g_init = false;
             static int g_warm = 0;
             static bool g_captured = false;
-            static bool g_init = false;
+            static const int kWarm = 6;
             static mx::array g_input = mx::zeros({1, 1}, mx::int32);
             static mx::array g_logits = mx::zeros({1}, mx::float32);
-            static int g_n = 0;
-            static double g_ms = 0.0;
-            auto* cache_ptr = cache_.empty() ? nullptr : &cache_;
+
+            auto* cache_ptr = &cache_;
             auto* state_ptr = state_.has_value() ? &state_.value() : nullptr;
-            if (!g_init) {
-                g_input = mx::zeros(batched.tokens.shape(), batched.tokens.dtype());
-                mx::eval(g_input);
-                g_init = true;
-            }
-            auto write_token = [&]() {
-                // Update the fixed input buffer's CONTENTS in place via a GPU op,
-                // NOT a host memcpy. The R9700 is a discrete GPU whose device-local
-                // buffers are not host-coherent — a host memcpy into g_input.data()
-                // never reaches the device, so the captured embedding gather reads
-                // stale/garbage indices on replay -> OOB -> GPU queue hang.
-                // slice_update over the full range runs a GPU kernel (device-
-                // coherent) and DONATES g_input's buffer in place (refcount==1),
-                // so g_input keeps the fixed address the captured graph baked in.
-                int32_t tok = batched.tokens.item<int32_t>();
-                auto t = mx::astype(mx::array(tok), g_input.dtype());
+
+            // Write slot = offset of the first full-attention (non-Mamba) cache.
+            auto trunk_pos = [&]() -> int {
+                for (auto& c : cache_) if (!c.as_mamba()) return c.offset();
+                return 0;
+            };
+            // Write the input token id into the fixed g_input buffer via a GPU op
+            // (device-coherent on the eGPU; a host memcpy never reaches the device).
+            // slice_update donates g_input in place so its address (baked into the
+            // captured embedding gather) stays stable across replays.
+            auto write_token = [&](const mx::array& tok) {
+                auto t = mx::astype(mx::reshape(tok, mx::Shape{}), g_input.dtype());
                 g_input = mx::slice_update(
                     g_input, mx::broadcast_to(t, g_input.shape()),
                     mx::Shape(g_input.ndim(), 0), g_input.shape());
                 mx::eval(g_input);
             };
-            // --- bisect toggles ---
-            static const bool g_nowarm = std::getenv("MLX_GRAPH_NOWARM") != nullptr;
-            static const bool g_natural = std::getenv("MLX_GRAPH_NATURAL") != nullptr;
+            // NOTE: graph decode is EXPERIMENTAL / opt-in (MLX_DECODE_GRAPH) and
+            // not correct past the first few replays on this hardware — between-
+            // replay allocations corrupt the captured forward's transient buffers,
+            // and the decode arena that would fix it deadlocks HIP-graph replay on
+            // RDNA. Default decode (graph_decode_enabled()==false) uses the eager
+            // path below. See HIP_KV_FINDINGS.md.
+            if (!g_init) {
+                mlx_lm::set_graph_external_pos(true);
+                g_input = mx::zeros({1, 1}, batched.tokens.dtype());
+                mx::eval(g_input);
+                g_init = true;
+            }
+
             if (!g_captured) {
-                if (++g_warm >= 6) {
-                    // Warm the allocator pools with a few eager forwards so the
-                    // captured forward (which cannot call hipMalloc while the
-                    // stream is capturing) reuses pooled buffers. No pin/restore:
-                    // slice_update donates in place (refcount==1), keeping the KV
-                    // buffer addresses stable for replay, and cache_ keeps them
-                    // alive across steps.
-                    int n_warm = g_nowarm ? 0 : 4;
-                    for (int w = 0; w < n_warm; w++) {
-                        write_token();
-                        auto rw = context_.call_fn(
-                            LMInput::Text(g_input, batched.mask), cache_ptr, state_ptr);
-                        mx::eval(rw.logits);
-                        state_ = rw.state;
-                        cache_ptr = cache_.empty() ? nullptr : &cache_;
-                        state_ptr = state_.has_value() ? &state_.value() : nullptr;
-                    }
-                    write_token();
-                    // Pin the WHOLE pre-capture cache (KV + Mamba) by copying the
-                    // cache vector — this is exactly what the working bench does.
-                    // The copy bumps every cache buffer's refcount to >=2, which:
-                    //   (1) forces KVCacheSimple.slice_update to COPY (not donate)
-                    //       during the capture forward, so the graph's KV read
-                    //       source and write destination are DISTINCT buffers that
-                    //       both stay alive (an in-place donation would alias them
-                    //       and fault on replay); and
-                    //   (2) keeps the gated-delta MambaCache conv/ssm buffers the
-                    //       graph reads alive after the forward replaces (*m)[i].
-                    // Held static for the captured graph's whole lifetime.
-                    static std::vector<KVCache> g_pinned_cache;
-                    g_pinned_cache = cache_;
-                    static std::optional<LMOutput::State> g_pinned_state;
-                    g_pinned_state = state_;
-                    cache_ptr = cache_.empty() ? nullptr : &cache_;
-                    state_ptr = g_pinned_state.has_value() ? &g_pinned_state.value() : nullptr;
-                    std::cerr << "[graph] warm done; pinned whole cache ("
-                              << g_pinned_cache.size() << " entries); begin_capture"
-                              << std::endl;
-                    gpu::gpu_graph_begin_capture();
-                    auto rc = context_.call_fn(
-                        g_natural ? batched : LMInput::Text(g_input, batched.mask),
-                        cache_ptr, state_ptr);
-                    std::cerr << "[graph] call_fn recorded; eval" << std::endl;
-                    mx::eval(rc.logits);
-                    std::cerr << "[graph] eval recorded; end_capture" << std::endl;
-                    bool _ok = gpu::gpu_graph_end_capture();
-                    std::cerr << "[graph] end_capture=" << _ok << "; replay" << std::endl;
-                    if (_ok) {
-                        g_logits = rc.logits;
-                        state_ = rc.state;
-                        g_captured = true;
-                        gpu::gpu_graph_replay(); // execute this captured step (sync)
-                        std::cerr << "[graph] captured decode step; replaying per token"
-                                  << std::endl;
-                        return convert_to_token(g_logits);
-                    }
-                    gpu::gpu_graph_reset();
+                if (++g_warm <= kWarm) {
+                    // Eager graph-mode warmup: device-pos attention, advancing pos.
+                    // Populates the persistent buffers and JIT-compiles every kernel
+                    // so the capture (which can't hipMalloc/JIT mid-stream) is clean.
+                    mlx_lm::set_graph_decode_pos(trunk_pos());
+                    auto r = context_.call_fn(batched, cache_ptr, state_ptr);
+                    mx::eval(r.logits);
+                    state_ = r.state;
+                    return convert_to_token(r.logits);
                 }
-                // else: warmup -> fall through to normal path below
+                // Capture one decode step. Retire prior work first so the in-place
+                // writes (KV slice_update donation, gated-delta state alias) are
+                // uniquely owned and record IN-PLACE, not as a baked full-buffer copy.
+                int pos = trunk_pos();
+                mlx_lm::set_graph_decode_pos(pos);
+                write_token(batched.tokens);
+                mx::synchronize(generation_stream());
+                if (g_dbg) std::cerr << "[graph] begin_capture pos=" << pos << std::endl;
+                mlx_lm::set_graph_capturing(true);
+                gpu::gpu_graph_begin_capture();
+                auto rc = context_.call_fn(
+                    LMInput::Text(g_input, batched.mask), cache_ptr, state_ptr);
+                mx::eval(rc.logits);
+                bool ok = gpu::gpu_graph_end_capture();
+                mlx_lm::set_graph_capturing(false);
+                if (g_dbg) std::cerr << "[graph] end_capture ok=" << ok << std::endl;
+                if (ok) {
+                    g_logits = rc.logits;
+                    state_ = rc.state;
+                    g_captured = true;
+                    gpu::gpu_graph_replay();  // capture only RECORDS — execute once
+                    return convert_to_token(g_logits);
+                }
+                gpu::gpu_graph_reset();
+                // capture failed: fall through to the normal eager path below.
             } else {
-                // Async replay by default: launch the graph onto the generation
-                // stream WITHOUT draining, then let convert_to_token's sampling
-                // ops queue right after it on the same stream (the .item() that
-                // reads the token is the single sync point). This restores the
-                // cross-token pipelining a per-token hipStreamSynchronize would
-                // kill. MLX_GRAPH_SYNC=1 forces the old blocking replay for A/B.
-                static const bool g_sync = std::getenv("MLX_GRAPH_SYNC") != nullptr;
-                write_token();
-                auto t0 = std::chrono::steady_clock::now();
-                if (g_sync) gpu::gpu_graph_replay();
-                else        gpu::gpu_graph_replay_async();
-                auto tok = convert_to_token(g_logits);
-                mx::eval(tok);  // force the per-token sync here so timing is honest
-                auto t1 = std::chrono::steady_clock::now();
-                g_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
-                if (++g_n % 64 == 0)
-                    std::cerr << "[graph] per-token avg " << (g_ms / g_n) << " ms ("
-                              << (1000.0 * g_n / g_ms) << " tok/s)" << std::endl;
-                return tok;
+                // Replay: advance the device pos in place (loop-owned), write the new
+                // input token, replay the captured step, sample.
+                mlx_lm::advance_graph_decode_pos(1);
+                write_token(batched.tokens);
+                gpu::gpu_graph_replay();
+                return convert_to_token(g_logits);
             }
         }
     }
@@ -1231,9 +1214,18 @@ std::optional<int> TokenIterator::next() {
     }
 
     // Standard path: single token generation.
+    static const bool g_sync_decode = std::getenv("MLX_SYNC_DECODE") != nullptr;
     auto previous_y = y_;
     auto token = step(previous_y);
     y_ = LMInput::Text(token);
+    if (g_sync_decode) {
+        // Diagnostic: fully retire each forward before building the next, so the
+        // previous step's KV slice is freed and slice_update donation can succeed.
+        mx::eval(token);
+        token_count_++;
+        measure_prefill_boundary_();
+        return token.item<int32_t>();
+    }
     mx::async_eval(token);
     token_count_++;
     mx::eval(previous_y.tokens);

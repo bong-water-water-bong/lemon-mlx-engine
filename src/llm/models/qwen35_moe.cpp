@@ -278,11 +278,17 @@ mx::array Qwen35MoEAttention::operator()(const mx::array& x,
         {0, 2, 1, 3});
     values = mx::transpose(mx::reshape(values, {B, L, num_kv_heads_, -1}), {0, 2, 1, 3});
 
-    // RoPE with partial rotary factor. MLX_DECODE_DEVICE_POS uses the
-    // device-position RoPE (graph-decode path); the default keeps fast::rope.
+    // RoPE with partial rotary factor. In graph-decode mode (graph_external_pos,
+    // set by the decode loop; MLX_DECODE_DEVICE_POS forces it for manual testing)
+    // we use device-position RoPE so one captured graph advances by bumping the
+    // device pos; the default eager path keeps the host-offset fast::rope.
     int offset = cache ? cache->offset() : 0;
-    static const bool g_devpos = std::getenv("MLX_DECODE_DEVICE_POS") != nullptr;
-    if (g_devpos) {
+    static const bool g_devpos_env = std::getenv("MLX_DECODE_DEVICE_POS") != nullptr;
+    // Graph-decode mode is DECODE-only (single token). Prefill (L>1) always uses
+    // the host-offset RoPE/attention path — one device position can't cover a
+    // multi-token prefill, and graph capture only ever records a 1-token step.
+    bool gmode = (mlx_lm::graph_external_pos() || g_devpos_env) && L == 1;
+    if (gmode) {
         mx::array pos = mlx_lm::graph_external_pos()
             ? mlx_lm::graph_decode_pos()
             : mx::array({offset}, {1}, mx::int32);
@@ -295,8 +301,7 @@ mx::array Qwen35MoEAttention::operator()(const mx::array& x,
 
     // KV cache update + SDPA.
     mx::array output(0.0f);
-    static const bool g_inplace_kv = std::getenv("MLX_GRAPH_INPLACE_KV") != nullptr;
-    if (g_devpos && g_inplace_kv && L == 1 && cache && cache->state().size() == 2) {
+    if (gmode && L == 1 && cache && cache->state().size() == 2) {
         // In-graph device-position decode: write the current token into the
         // fixed-CAP buffer at slot `pos` (in place, stable address), then attend
         // over the whole buffer with a length mask. One captured graph advances
@@ -316,7 +321,7 @@ mx::array Qwen35MoEAttention::operator()(const mx::array& x,
                         {1, 1, 1, CAP}),
             x.dtype());
         output = sdpa(queries, full_k, full_v, scale_, AttentionMask::from_array(addmask));
-    } else if (g_devpos && L == 1 && cache) {
+    } else if (gmode && L == 1 && cache) {
         // Write-free graph-decode forward: read the fixed-CAP KV buffer, concat
         // the current token, attend with a device-position mask. No in-place
         // write (self-aliases under capture). Append is eager; the graph harness
@@ -489,7 +494,19 @@ mx::array Qwen35MoEGatedDeltaNet::operator()(
     // Save conv state for next step
     if (cache) {
         int start = conv_input.shape(1) - (conv_kernel_size_ - 1);
-        (*cache)[0] = mx::slice(conv_input, {0, start, 0}, {B, conv_input.shape(1), conv_dim_});
+        auto new_conv = mx::slice(conv_input, {0, start, 0}, {B, conv_input.shape(1), conv_dim_});
+        static const bool no_inplace_conv = std::getenv("MLX_GRAPH_NO_INPLACE") != nullptr;
+        if (mlx_lm::graph_capturing() && !no_inplace_conv && (*cache)[0].has_value() &&
+            (*cache)[0].value().shape() == new_conv.shape()) {
+            // Graph capture: write the rolling conv window into the PERSISTENT
+            // conv buffer IN PLACE (output aliases the buffer), so the captured
+            // graph's conv recurrence reads/writes one fixed buffer and
+            // accumulates across replays (a fresh slice would freeze at capture).
+            // Eager warmup keeps the normal reassignment below.
+            (*cache)[0] = inplace_write((*cache)[0].value(), new_conv);
+        } else {
+            (*cache)[0] = new_conv;
+        }
     }
 
     // T=1 decode fast path
@@ -545,9 +562,15 @@ mx::array Qwen35MoEGatedDeltaNet::operator()(
 
         static const bool use_fused_gdn = std::getenv("MLX_GDN_NO_FUSED") == nullptr;
         if (use_fused_gdn) {
+            // Graph capture: write the new SSM state IN PLACE into the persistent
+            // state buffer (the fused kernel's state_out aliases state_in), so the
+            // captured graph's recurrence accumulates across replays. Eager warmup
+            // keeps the normal fresh-buffer reassignment.
+            static const bool no_inplace = std::getenv("MLX_GRAPH_NO_INPLACE") != nullptr;
+            bool inplace_state = mlx_lm::graph_capturing() && !no_inplace && (*cache)[1].has_value();
             auto [o, ns] = gated_delta_update(
                 q_out, k_out, v_out, a_val, b_val, a_log_, dt_bias_, ssm_state,
-                std::nullopt);
+                std::nullopt, inplace_state);
             (*cache)[1] = ns;
             auto normalized = norm_(o, z);
             return linear_fwd(mx::reshape(normalized, {B, S, -1}), out_proj_weight_);
@@ -1047,9 +1070,13 @@ std::vector<KVCache> Qwen35MoEModel::new_cache_impl(const GenerateParameters& pa
     // doubling path, which makes small incremental copies and runs clean.
     // MLX_KV_STATIC opts back into the preallocated buffer (e.g. for graph capture
     // once the large-copy path is fixed). --ctx-size still pins an explicit cap.
-    static const bool no_static = std::getenv("MLX_KV_STATIC") == nullptr;
-    int cap = (!no_static && params.ctx_size > 0) ? params.ctx_size : 256;
-    int reserve = no_static
+    // HIP-graph decode REQUIRES a static, fixed-address KV buffer (the device-
+    // position write targets a preallocated buffer). So allocate static whenever
+    // graph decode is enabled, or when explicitly requested via MLX_KV_STATIC.
+    bool want_static =
+        std::getenv("MLX_KV_STATIC") != nullptr || mlx_lm::graph_decode_enabled();
+    int cap = (want_static && params.ctx_size > 0) ? params.ctx_size : 256;
+    int reserve = !want_static
         ? 0
         : (params.ctx_size > 0
             ? 0
