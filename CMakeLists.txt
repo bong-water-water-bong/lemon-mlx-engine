@@ -110,7 +110,6 @@ add_library(mlx-lm-common
     src/common/kv_cache.cpp
     src/common/attention_utils.cpp
     src/common/generate.cpp
-    src/common/graph_decode.cpp
     src/common/base_config.cpp
     src/common/hub_api.cpp
     src/common/safetensors.cpp
@@ -253,34 +252,6 @@ if(MLX_LM_BUILD_EXAMPLES)
 
     add_executable(test_sdpa_ref examples/test_sdpa_ref.cpp)
     target_link_libraries(test_sdpa_ref PRIVATE mlx)
-
-    # graph_probe exercises the ROCm-only HIP graph capture/replay symbols
-    # (mlx::core::gpu_graph_*/gpu_arena_*), which only exist in the ROCm backend.
-    # Building it on CPU/macOS fails to link, so gate it on the ROCm backend.
-    if(MLX_BUILD_ROCM)
-        add_executable(test_graph_const examples/test_graph_const.cpp)
-        target_link_libraries(test_graph_const PRIVATE mlx)
-        target_compile_definitions(test_graph_const PRIVATE MLX_BUILD_ROCM)
-
-        add_executable(test_graph_counter examples/test_graph_counter.cpp)
-        target_link_libraries(test_graph_counter PRIVATE mlx)
-        target_compile_definitions(test_graph_counter PRIVATE MLX_BUILD_ROCM)
-
-        add_executable(test_graph_kv_advance examples/test_graph_kv_advance.cpp)
-        target_link_libraries(test_graph_kv_advance PRIVATE mlx)
-        target_compile_definitions(test_graph_kv_advance PRIVATE MLX_BUILD_ROCM)
-
-        add_executable(graph_probe examples/graph_probe.cpp)
-        target_link_libraries(graph_probe PRIVATE mlx)
-
-        add_executable(test_graph_inc examples/test_graph_inc.cpp)
-        target_link_libraries(test_graph_inc PRIVATE mlx)
-        target_compile_definitions(test_graph_inc PRIVATE MLX_BUILD_ROCM)
-
-        add_executable(test_graph_attn examples/test_graph_attn.cpp)
-        target_link_libraries(test_graph_attn PRIVATE mlx)
-        target_compile_definitions(test_graph_attn PRIVATE MLX_BUILD_ROCM)
-    endif()
 
     add_executable(server
         examples/server.cpp
