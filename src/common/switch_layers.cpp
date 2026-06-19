@@ -84,10 +84,16 @@ mx::array SwitchLinear::operator()(
     auto* qi = QuantizedWeightRegistry::instance().find(&weight_);
 
     mx::array result(0.0f);
+    // Explicit lhs_indices forces right_sorted_=false in gather_qmm
+    // (right_sorted_ = sorted_indices && !lhs_indices), which disables the
+    // expert-batched prefill kernel. Pass nullopt when sorting so it's reachable.
+    std::optional<mx::array> lhs =
+        sorted_indices ? std::nullopt
+                       : std::optional<mx::array>(default_lhs_indices(x));
     if (qi) {
         result = mx::gather_qmm(
             x, weight_, qi->scales, qi->biases,
-            /*lhs_indices=*/std::optional<mx::array>(default_lhs_indices(x)),
+            /*lhs_indices=*/lhs,
             /*rhs_indices=*/std::optional<mx::array>(indices),
             /*transpose=*/true,
             /*group_size=*/qi->group_size,
