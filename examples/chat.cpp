@@ -203,8 +203,12 @@ int main(int argc, char* argv[]) {
             size_t budget = mx::get_memory_limit();
             size_t active = mx::get_active_memory();
             size_t free_after_model = (budget > active) ? (budget - active) : 0;
-            size_t cache_cap =
-                std::min<size_t>(static_cast<size_t>(2) << 30, free_after_model / 4);
+            // Scale the reuse pool to the post-model free space. On unified-memory
+            // APUs the pool lives in system RAM, so a small fixed cap (discrete-GPU
+            // heuristic) forces constant eviction — each eviction is a blocking
+            // hipFree on unified memory that can deadlock under async load. A large
+            // budget keeps freed buffers pooled and off the hipFree path.
+            size_t cache_cap = free_after_model / 4;
             mx::set_cache_limit(cache_cap);
         }
 
