@@ -349,8 +349,6 @@ mx::array TokenIterator::step(const LMInput::Text& previous) {
         int Lstep = batched.tokens.shape(batched.tokens.ndim() - 1);
         if (g_graph && Lstep == 1 && !cache_.empty() && !processor_.has_value()) {
             namespace gpu = mlx::core;
-            static const bool g_dbg = std::getenv("MLX_GRAPH_DEBUG") != nullptr;
-            static const bool g_pt = std::getenv("MLX_POS_TRACE") != nullptr;
             static bool g_init = false;
             static int g_warm = 0;
             static bool g_captured = false;
@@ -375,18 +373,10 @@ mx::array TokenIterator::step(const LMInput::Text& previous) {
             // raw kernel — slice_update would reallocate g_input to a new address,
             // but the captured graph reads g_input's baked address, so an in-place
             // write is required for replays to see each new token.
-            static const char* g_force = std::getenv("MLX_FORCE_TOK");
-            static int g_force_ctr = 0;
             auto write_token = [&](const mx::array& tok) {
-                int id;
-                if (g_force) {
-                    id = 1000 + (g_force_ctr++ % 64);  // diagnostic: vary input
-                } else {
-                    mx::array t = mx::reshape(tok, mx::Shape{1});
-                    mx::eval(t);
-                    id = t.item<int>();
-                }
-                gpu::gpu_kv_pos_set(g_input, id);
+                mx::array t = mx::reshape(tok, mx::Shape{1});
+                mx::eval(t);
+                gpu::gpu_kv_pos_set(g_input, t.item<int>());
             };
 
             if (!g_init) {
@@ -398,7 +388,6 @@ mx::array TokenIterator::step(const LMInput::Text& previous) {
 
             if (!g_captured) {
                 if (++g_warm <= kWarm) {
-                    if (g_pt) std::cerr << "[warmup] " << g_warm << " pos=" << trunk_pos() << std::endl;
                     // Eager graph-mode warmup: populate buffers + JIT kernels.
                     mlx_lm::set_graph_decode_pos(trunk_pos());
                     auto r = context_.call_fn(batched, cache_ptr, state_ptr);
@@ -430,7 +419,6 @@ mx::array TokenIterator::step(const LMInput::Text& previous) {
                     }
                 }
                 mx::synchronize(generation_stream());
-                if (g_dbg) std::cerr << "[graph] begin_capture pos=" << pos << std::endl;
                 // Activate the DecodeArena so the captured forward's buffers get
                 // deterministic, stable addresses (a bump allocator that hands back
                 // identical pointers each reset). Without this the buffers come from
@@ -471,7 +459,6 @@ mx::array TokenIterator::step(const LMInput::Text& previous) {
                 mx::eval(capture_eval);
                 bool ok = gpu::gpu_graph_end_capture();
                 mlx_lm::set_graph_capturing(false);
-                if (g_dbg || g_pt) std::cerr << "[capture] ok=" << ok << " pos=" << pos << std::endl;
                 if (ok) {
                     g_logits = logits_out;
                     state_ = rc.state;
@@ -513,31 +500,6 @@ mx::array TokenIterator::step(const LMInput::Text& previous) {
                 // every replay (frozen output).
                 mx::synchronize(generation_stream());
                 gpu::gpu_graph_replay();
-                if (g_pt) {
-                    auto& p = mlx_lm::graph_decode_pos();
-                    mx::eval(p);
-                    int pv = p.item<int>();
-                    float ksum = -1.f;
-                    for (auto& c : cache_) {
-                        if (!c.as_mamba()) {
-                            auto st = c.state();
-                            if (!st.empty() && pv >= 1) {
-                                auto k = st[0];  // [B,H,CAP,D]
-                                int H = k.shape(1), D = k.shape(3);
-                                auto row = mx::slice(k, {0, 0, pv - 1, 0},
-                                                     {1, H, pv, D});
-                                auto s = mx::sum(mx::abs(mx::astype(row, mx::float32)));
-                                mx::eval(s);
-                                ksum = s.item<float>();
-                            }
-                            break;
-                        }
-                    }
-                    std::cerr << "[replay] pos=" << pv
-                              << " tok_in=" << g_input.item<int>()
-                              << " kv_slot[" << (pv - 1) << "]_sum=" << ksum
-                              << std::endl;
-                }
                 // Materialize the token to a detached host constant before the next
                 // replay overwrites g_logits and before the next arena rewind reuses
                 // the sampling region (a lazy token would dangle).
@@ -1038,8 +1000,6 @@ std::optional<int> TokenIterator::next() {
     mx::eval(previous_y.tokens);
     measure_prefill_boundary_();
     int32_t tid = previous_y.tokens.item<int32_t>();
-    static const bool g_tt = std::getenv("MLX_TOK_TRACE") != nullptr;
-    if (g_tt) std::cerr << "[tok] " << token_count_ << " = " << tid << std::endl;
     return tid;
 }
 

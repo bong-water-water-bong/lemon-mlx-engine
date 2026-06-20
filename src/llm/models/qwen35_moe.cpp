@@ -357,7 +357,7 @@ mx::array Qwen35MoEAttention::operator()(const mx::array& x,
                         {1, 1, 1, CAP + 1}),
             x.dtype());
         output = sdpa(queries, k_all, v_all, scale_, AttentionMask::from_array(addmask));
-        if (!std::getenv("MLX_GRAPH_NO_APPEND")) cache->update(keys, values);
+        cache->update(keys, values);
     } else {
         if (cache) {
             auto [k, v] = cache->update(keys, values);
