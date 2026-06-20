@@ -452,7 +452,23 @@ mx::array TokenIterator::step(const LMInput::Text& previous) {
                 // engine reads. mx::copy emits a real kernel into a clean buffer that
                 // g_logits owns and that the replay re-writes every token.
                 auto logits_out = mx::contiguous(mx::copy(rc.logits));
-                mx::eval(logits_out);
+                // The GatedDeltaNet recurrent-state writes ((*cache)[i] =
+                // slice_update(...)) do NOT feed the logits, so evaluating only
+                // logits_out would leave them out of the captured graph — the
+                // state buffer would then stay frozen at capture values on every
+                // replay (decode reverts to the warmup state). Evaluate the
+                // state arrays IN THE SAME eval so their in-place writes are
+                // recorded into the graph and re-execute on replay (mirroring the
+                // side-effecting KV write).
+                std::vector<mx::array> capture_eval = {logits_out};
+                for (auto& c : cache_) {
+                    if (auto* m = c.as_mamba()) {
+                        for (int i = 0; i < 2; ++i)
+                            if ((*m)[i].has_value())
+                                capture_eval.push_back((*m)[i].value());
+                    }
+                }
+                mx::eval(capture_eval);
                 bool ok = gpu::gpu_graph_end_capture();
                 mlx_lm::set_graph_capturing(false);
                 if (g_dbg || g_pt) std::cerr << "[capture] ok=" << ok << " pos=" << pos << std::endl;
@@ -517,11 +533,9 @@ mx::array TokenIterator::step(const LMInput::Text& previous) {
                             break;
                         }
                     }
-                    unsigned msum = 0, csum = 0;
                     std::cerr << "[replay] pos=" << pv
                               << " tok_in=" << g_input.item<int>()
                               << " kv_slot[" << (pv - 1) << "]_sum=" << ksum
-                              << " ssm_h=" << msum << " conv_h=" << csum
                               << std::endl;
                 }
                 // Materialize the token to a detached host constant before the next
