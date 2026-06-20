@@ -12,6 +12,7 @@
 #include <mlx-lm/llm/models/qwen35_moe.h>
 #include <mlx-lm/llm/models/mtp_head.h>
 #include <mlx-lm/common/attention_utils.h>
+#include <mlx-lm/common/graph_decode.h>
 #include <mlx-lm/common/activations.h>
 #include <mlx-lm/common/quantized_linear.h>
 #include <algorithm>
@@ -277,19 +278,94 @@ mx::array Qwen35MoEAttention::operator()(const mx::array& x,
         {0, 2, 1, 3});
     values = mx::transpose(mx::reshape(values, {B, L, num_kv_heads_, -1}), {0, 2, 1, 3});
 
-    // RoPE with partial rotary factor.
+    // RoPE with partial rotary factor; device-position RoPE in graph-decode mode.
     int offset = cache ? cache->offset() : 0;
-    queries = mx::fast::rope(queries, rope_dims_, false, rope_theta_, 1.0f, offset);
-    keys = mx::fast::rope(keys, rope_dims_, false, rope_theta_, 1.0f, offset);
+    static const bool g_devpos_env = std::getenv("MLX_DECODE_DEVICE_POS") != nullptr;
+    // Graph-decode mode is decode-only (single token).
+    bool gmode = (mlx_lm::graph_external_pos() || g_devpos_env) && L == 1;
+    if (gmode) {
+        mx::array pos = mlx_lm::graph_external_pos()
+            ? mlx_lm::graph_decode_pos()
+            : mx::array({offset}, {1}, mx::int32);
+        queries = mx::fast::rope(queries, rope_dims_, false, rope_theta_, 1.0f, pos);
+        keys = mx::fast::rope(keys, rope_dims_, false, rope_theta_, 1.0f, pos);
+    } else {
+        queries = mx::fast::rope(queries, rope_dims_, false, rope_theta_, 1.0f, offset);
+        keys = mx::fast::rope(keys, rope_dims_, false, rope_theta_, 1.0f, offset);
+    }
 
     // KV cache update + SDPA.
     mx::array output(0.0f);
-    if (cache) {
-        auto [k, v] = cache->update(keys, values);
-        keys = k;
-        values = v;
+    if (gmode && L == 1 && cache && cache->state().size() == 2) {
+        // In-graph device-position decode: write token at slot `pos`, attend over
+        // the whole buffer with a length mask.
+        mx::array pos = mlx_lm::graph_external_pos()
+            ? mlx_lm::graph_decode_pos()
+            : mx::array({cache->offset()}, {1}, mx::int32);
+        auto kv = cache->update_at_pos(keys, values, pos);
+        const auto& full_k = kv.first;
+        const auto& full_v = kv.second;
+        int CAP = full_k.shape(2);
+        auto cols = mx::arange(0, CAP, mx::int32);
+        auto addmask = mx::astype(
+            mx::reshape(mx::where(mx::less_equal(cols, pos), mx::array(0.0f),
+                                  mx::array(-std::numeric_limits<float>::infinity())),
+                        {1, 1, 1, CAP}),
+            x.dtype());
+        output = sdpa(queries, full_k, full_v, scale_, AttentionMask::from_array(addmask));
+    } else if (gmode && L == 1 && cache) {
+        // Write-free graph-decode forward: concat the current token, attend with
+        // a device-position mask.
+        auto st = cache->state();
+        if (st.size() < 2) {
+            cache->update(keys, values);
+            auto st2 = cache->state();
+            const auto& fk = st2[0];
+            const auto& fv = st2[1];
+            int CAP2 = fk.shape(2);
+            auto cols2 = mx::arange(0, CAP2, mx::int32);
+            auto pos2 = mx::array({cache->offset() - 1}, {1}, mx::int32);
+            auto m2 = mx::astype(
+                mx::reshape(mx::where(mx::less_equal(cols2, pos2), mx::array(0.0f),
+                                      mx::array(-std::numeric_limits<float>::infinity())),
+                            {1, 1, 1, CAP2}),
+                x.dtype());
+            output = sdpa(queries, fk, fv, scale_, AttentionMask::from_array(m2));
+            output = mx::reshape(mx::transpose(output, {0, 2, 1, 3}), {B, L, -1});
+            static auto compiled_gate0 = mx::compile(
+                [](const std::vector<mx::array>& in) -> std::vector<mx::array> {
+                    return {mx::multiply(in[0], mx::sigmoid(in[1]))}; },
+                /*shapeless=*/true);
+            return linear_fwd(compiled_gate0({output, gate})[0], o_proj_weight_,
+                              o_proj_bias_);
+        }
+        const auto& past_k = st[0];
+        const auto& past_v = st[1];
+        int CAP = past_k.shape(2);
+        auto k_all = mx::concatenate({past_k, keys}, 2);    // [B,H,CAP+1,D]
+        auto v_all = mx::concatenate({past_v, values}, 2);
+        auto cols = mx::arange(0, CAP + 1, mx::int32);
+        mx::array pos = mlx_lm::graph_external_pos()
+            ? mlx_lm::graph_decode_pos()
+            : mx::array({cache->offset()}, {1}, mx::int32);  // N past tokens
+        // valid = past index in [0,N)  OR  the appended current token (last slot)
+        auto valid = mx::logical_or(mx::less(cols, pos),
+                                    mx::equal(cols, mx::array(CAP, mx::int32)));
+        auto addmask = mx::astype(
+            mx::reshape(mx::where(valid, mx::array(0.0f),
+                                  mx::array(-std::numeric_limits<float>::infinity())),
+                        {1, 1, 1, CAP + 1}),
+            x.dtype());
+        output = sdpa(queries, k_all, v_all, scale_, AttentionMask::from_array(addmask));
+        if (!std::getenv("MLX_GRAPH_NO_APPEND")) cache->update(keys, values);
+    } else {
+        if (cache) {
+            auto [k, v] = cache->update(keys, values);
+            keys = k;
+            values = v;
+        }
+        output = sdpa(queries, keys, values, scale_, mask);
     }
-    output = sdpa(queries, keys, values, scale_, mask);
     output = mx::reshape(mx::transpose(output, {0, 2, 1, 3}), {B, L, -1});
 
     // Swift: oProj(sigmoidMultiply(output, gate))
@@ -409,7 +485,15 @@ mx::array Qwen35MoEGatedDeltaNet::operator()(
     if (cache) {
         int start = conv_input.shape(1) - (conv_kernel_size_ - 1);
         auto new_conv = mx::slice(conv_input, {0, start, 0}, {B, conv_input.shape(1), conv_dim_});
-        (*cache)[0] = new_conv;
+        static const bool no_inplace_conv = std::getenv("MLX_GRAPH_NO_INPLACE") != nullptr;
+        if (mlx_lm::graph_capturing() && !no_inplace_conv && (*cache)[0].has_value() &&
+            (*cache)[0].value().shape() == new_conv.shape()) {
+            // Graph capture: write the rolling conv window into the persistent
+            // conv buffer in place.
+            (*cache)[0] = inplace_write((*cache)[0].value(), new_conv);
+        } else {
+            (*cache)[0] = new_conv;
+        }
     }
 
     // T=1 decode fast path
@@ -453,8 +537,12 @@ mx::array Qwen35MoEGatedDeltaNet::operator()(
 
         static const bool use_fused_gdn = std::getenv("MLX_GDN_NO_FUSED") == nullptr;
         if (use_fused_gdn) {
+            // Graph capture: write the new SSM state in place into the persistent buffer.
+            static const bool no_inplace = std::getenv("MLX_GRAPH_NO_INPLACE") != nullptr;
+            bool inplace_state = mlx_lm::graph_capturing() && !no_inplace && (*cache)[1].has_value();
             auto [o, ns] = gated_delta_update(
-                q_out, k_out, v_out, a_val, b_val, a_log_, dt_bias_, ssm_state);
+                q_out, k_out, v_out, a_val, b_val, a_log_, dt_bias_, ssm_state,
+                std::nullopt, inplace_state);
             (*cache)[1] = ns;
             auto normalized = norm_(o, z);
             return linear_fwd(mx::reshape(normalized, {B, S, -1}), out_proj_weight_);
@@ -939,9 +1027,10 @@ mx::array Qwen35MoEModel::forward_impl(const mx::array& inputs, std::vector<KVCa
 std::vector<KVCache> Qwen35MoEModel::new_cache_impl(const GenerateParameters& params) {
     std::vector<KVCache> caches;
     caches.reserve(config_.num_hidden_layers);
-    // Use a static, fixed-address KV buffer when MLX_KV_STATIC is set;
+    // Use a static, fixed-address KV buffer for graph decode or MLX_KV_STATIC;
     // otherwise grow-by-doubling.
-    bool want_static = std::getenv("MLX_KV_STATIC") != nullptr;
+    bool want_static =
+        std::getenv("MLX_KV_STATIC") != nullptr || mlx_lm::graph_decode_enabled();
     int cap = (want_static && params.ctx_size > 0) ? params.ctx_size : 256;
     int reserve = !want_static
         ? 0
