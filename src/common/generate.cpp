@@ -21,6 +21,7 @@ namespace mlx::core {
 bool gpu_arena_begin(size_t capacity);
 void gpu_arena_reset();
 void gpu_arena_reset_to(size_t byte_mark, size_t desc_mark);
+void gpu_arena_set_paused(bool p);
 size_t gpu_arena_desc_used();
 void gpu_arena_end();
 size_t gpu_arena_used();
@@ -409,6 +410,25 @@ mx::array TokenIterator::step(const LMInput::Text& previous) {
                 int pos = trunk_pos();
                 mlx_lm::set_graph_decode_pos(pos);
                 write_token(batched.tokens);
+                // Force the GatedDeltaNet recurrent state (conv window + SSM state)
+                // to CONTIGUOUS, materialized, pool-backed buffers BEFORE capture.
+                // Warmup leaves the conv state as a non-contiguous slice view; an
+                // in-place custom-kernel write whose output aliases a non-contiguous
+                // input reads a copy but writes the original (mismatch) → the state
+                // drifts across replays. Making them contiguous makes the in-place
+                // write a true read-modify-write on a stable address.
+                for (auto& c : cache_) {
+                    if (auto* m = c.as_mamba()) {
+                        for (int i = 0; i < 2; ++i) {
+                            if ((*m)[i].has_value()) {
+                                auto cont = mx::contiguous((*m)[i].value());
+                                mx::eval(cont);  // materialize NOW (arena inactive =>
+                                                 // pool buffer with a stable address)
+                                (*m)[i] = cont;
+                            }
+                        }
+                    }
+                }
                 mx::synchronize(generation_stream());
                 if (g_dbg) std::cerr << "[graph] begin_capture pos=" << pos << std::endl;
                 // Activate the DecodeArena so the captured forward's buffers get
@@ -445,6 +465,12 @@ mx::array TokenIterator::step(const LMInput::Text& previous) {
                     // [mark, …) while the graph region [0, mark) is never overwritten.
                     g_arena_mark = gpu::gpu_arena_used();
                     g_arena_desc_mark = gpu::gpu_arena_desc_used();
+                    // Pause the arena: the captured graph keeps its arena buffers
+                    // (backing stays valid at baked addresses), but all further
+                    // allocations (per-token sampling + any replay-time temporaries)
+                    // route to the POOL — so sampling can never clobber the graph's
+                    // arena buffers and corrupt the next replay.
+                    gpu::gpu_arena_set_paused(true);
                     gpu::gpu_graph_replay();  // capture only records — execute once
                     // Materialize the token to a detached host constant: g_logits is
                     // the captured graph's output buffer (overwritten by the next
@@ -459,9 +485,10 @@ mx::array TokenIterator::step(const LMInput::Text& previous) {
                 // Replay: rewind the arena to the post-capture mark (BOTH byte offset
                 // and descriptor index) so the graph's buffers/descriptors [0, mark)
                 // stay intact and only per-token sampling reuses [mark, …).
-                static const bool g_use_arena2 = std::getenv("MLX_NO_ARENA") == nullptr;
-                if (g_use_arena2)
-                    gpu::gpu_arena_reset_to(g_arena_mark, g_arena_desc_mark);
+                // Arena is paused after capture; sampling uses the pool, so no
+                // per-replay arena rewind is needed (and reset_to corrupted the
+                // next replay). g_arena_mark/desc kept for reference only.
+                (void)g_arena_mark; (void)g_arena_desc_mark;
                 mlx_lm::advance_graph_decode_pos(1);
                 write_token(batched.tokens);
                 // Ensure the in-place pos/token writes land before the graph reads
@@ -494,7 +521,7 @@ mx::array TokenIterator::step(const LMInput::Text& previous) {
                     std::cerr << "[replay] pos=" << pv
                               << " tok_in=" << g_input.item<int>()
                               << " kv_slot[" << (pv - 1) << "]_sum=" << ksum
-                              << " ssm_sum=" << msum << " conv_sum=" << csum
+                              << " ssm_h=" << msum << " conv_h=" << csum
                               << std::endl;
                 }
                 // Materialize the token to a detached host constant before the next
@@ -996,7 +1023,10 @@ std::optional<int> TokenIterator::next() {
     token_count_++;
     mx::eval(previous_y.tokens);
     measure_prefill_boundary_();
-    return previous_y.tokens.item<int32_t>();
+    int32_t tid = previous_y.tokens.item<int32_t>();
+    static const bool g_tt = std::getenv("MLX_TOK_TRACE") != nullptr;
+    if (g_tt) std::cerr << "[tok] " << token_count_ << " = " << tid << std::endl;
+    return tid;
 }
 
 // ---------------------------------------------------------------------------
