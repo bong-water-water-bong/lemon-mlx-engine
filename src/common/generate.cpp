@@ -494,12 +494,14 @@ mx::array TokenIterator::step(const LMInput::Text& previous) {
                 (void)g_arena_mark; (void)g_arena_desc_mark;
                 mlx_lm::advance_graph_decode_pos(1);
                 write_token(batched.tokens);
-                // Ensure the in-place pos/token writes land before the graph reads
-                // them — they run on the default encoder stream, the graph replays on
-                // its own stream, so without this the graph reads capture-time values
-                // every replay (frozen output).
-                mx::synchronize(generation_stream());
-                gpu::gpu_graph_replay();
+                // The pos/token writes and the replay all launch on the SAME
+                // generation stream (launch_kernel submits immediately), so the
+                // graph reads the fresh values in stream order — no drain needed.
+                // Async replay: the captured graph launches on the generation
+                // stream and the following convert_to_token + eval run on the
+                // same stream, so they order after the graph without a separate
+                // drain. The eval below is the single per-token sync.
+                gpu::gpu_graph_replay_async();
                 // Materialize the token to a detached host constant before the next
                 // replay overwrites g_logits and before the next arena rewind reuses
                 // the sampling region (a lazy token would dangle).
