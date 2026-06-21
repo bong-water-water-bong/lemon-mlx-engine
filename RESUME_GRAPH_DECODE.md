@@ -4,12 +4,27 @@
 Make HIP-graph decode produce coherent 1k-in/1k-out output AND beat eager
 (~41 tok/s) on gfx1151 (APU, device 0), q4 model `~/mtp_convert/qwen36_4bit_v6`.
 
-## TL;DR status
-- **Production path that WORKS: eager decode, 41 tok/s, coherent.** Default build
-  (graphs-OFF). Verified on both 7.12 and 7.13 runtimes. Ship this.
-- **graphs-ON (`MLX_USE_HIP_GRAPHS=1`) is WIP and produces garbage.** Runs
-  end-to-end on the 7.13 runtime but output is wrong. Two compounding bugs
-  isolated (below). Gated OFF by default — does not affect production.
+## TL;DR status — RESOLVED (2026-06-21)
+- **graphs-ON (`MLX_USE_HIP_GRAPHS=1`) WORKS** on the 7.13 runtime: generates a
+  full **coherent 1000-token** story, bit-identical to eager, no crash/OOM, at
+  **19.9 tok/s** (commit `8070d503`).
+- **Root cause was a ROCm CLR library bug** (hip#3887 / clr#138): per-node kernarg
+  corruption once one instantiated graph holds >~3 heterogeneous kernel nodes.
+  Verified: 3-node graphs == eager bit-for-bit; 4+ → garbage. NOT an MLX bug.
+- **Fix:** cap `max_ops_per_graph` at 2 (graphs <=3 nodes) + destroy each exec via
+  a completion handler after its async launch (avoids OOM over long generation).
+- **Speed caveat:** 19.9 < eager 41 because the CLR bug forces tiny graphs, killing
+  the batching win. That ceiling lifts only when AMD fixes CLR (then raise the cap).
+- **Production:** eager (graphs-OFF, default) at 41 tok/s coherent is still the
+  faster path today; graphs-ON is correct but slower until the CLR fix.
+
+### How the bug was found (do not re-derive)
+Per-op eager-vs-graph checksum (`MLX_GRAPH_CHECKSUM` in eval.cpp): IDENTICAL for all
+9636 ops when force-executed -> kernels/marshaling correct. Batch-size bisection
+(`MLX_MAX_OPS_PER_BUFFER`): 2 correct, 3+ garbage. Standalone HIP repros
+(/tmp/graphtest{1..5}.hip): single node, tuple/pack marshaling, 2-node A->B deps,
+10-node chain, 4-node pack chain — ALL correct in isolation -> bug is CLR's
+multi-heterogeneous-node kernarg handling, matching hip#3887 (gfx1201/LLM-decode).
 
 ## Build & run (ALWAYS use 7.13 — see memory `rocm_must_use_7_13_for_graphs`)
 ```
