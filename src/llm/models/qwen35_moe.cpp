@@ -404,31 +404,13 @@ mx::array Qwen35MoEGatedDeltaNet::operator()(
         qkv = mx::where(mx::expand_dims(*mask, -1), qkv, mx::zeros_like(qkv));
     }
 
-    auto conv_input = mx::concatenate({conv_state, qkv}, 1);
-
-    // Save conv state for next step
-    if (cache) {
-        int start = conv_input.shape(1) - (conv_kernel_size_ - 1);
-        auto new_conv = mx::slice(conv_input, {0, start, 0}, {B, conv_input.shape(1), conv_dim_});
-        (*cache)[0] = new_conv;
-    }
-
-    // T=1 decode fast path
-    if (S == 1 && cache && (*cache)[0].has_value() && conv_input.shape(1) == conv_kernel_size_) {
-        // Fused conv1d + silu; build the reshaped conv weight once and reuse.
-        if (!conv1d_w_dec_.has_value()) {
-            conv1d_w_dec_ = mx::reshape(
-                mx::transpose(mx::reshape(conv1d_weight_, {conv_dim_, conv_kernel_size_})),
-                {1, conv_kernel_size_, conv_dim_});
-        }
-        const mx::array& w = *conv1d_w_dec_;
-        static auto compiled_conv_silu = mx::compile(
-            [](const std::vector<mx::array>& inputs) -> std::vector<mx::array> {
-                auto dot = mx::sum(mx::multiply(inputs[0], inputs[1]), 1, true);
-                return {mx::multiply(dot, mx::sigmoid(dot))};
-            },
-            /*shapeless=*/true);
-        auto conv_out = compiled_conv_silu({conv_input, w})[0];
+    // T=1 decode fast path: one fused conv-step kernel replaces the
+    // concatenate(state,qkv) + slice(new_state) + conv1d + silu op chain,
+    // eliminating their copy_gg/copy_g kernels.
+    if (S == 1 && cache) {
+        auto [conv_out, new_state] =
+            gdn_conv_step(conv_state, qkv, conv1d_weight_);
+        (*cache)[0] = new_state;
 
         // Split into q, k, v
         auto q_out = mx::reshape(mx::slice(conv_out, {0, 0, 0}, {B, 1, key_dim_}),
@@ -523,7 +505,16 @@ mx::array Qwen35MoEGatedDeltaNet::operator()(
         return linear_fwd(mx::reshape(normalized, {B, S, -1}), out_proj_weight_);
     }
 
-    // General path: T>1 prefill
+    // General path: T>1 prefill (also S==1 with no cache). Build the conv input
+    // window and save the trailing state here (the decode fast path above does
+    // this inside the fused kernel instead).
+    auto conv_input = mx::concatenate({conv_state, qkv}, 1);
+    if (cache) {
+        int start = conv_input.shape(1) - (conv_kernel_size_ - 1);
+        auto new_conv = mx::slice(conv_input, {0, start, 0},
+                                  {B, conv_input.shape(1), conv_dim_});
+        (*cache)[0] = new_conv;
+    }
     auto conv_out = mx::conv1d(conv_input, conv1d_weight_, 1, 0, 1, conv_dim_);
     conv_out = silu(conv_out);
 
@@ -735,8 +726,9 @@ mx::array Qwen35MoEDecoderLayer::operator()(
         h = (*self_attn_)(normed, attention_mask, cache);
     }
 
-    auto r = mx::add(x, h);
-    auto post_normed = mx::fast::rms_norm(r, post_attention_layernorm_weight_, rms_norm_eps_);
+    // Fused residual-add + post-attention RMSNorm (one kernel; sum stays on-chip).
+    auto [r, post_normed] =
+        add_rms_norm(x, h, post_attention_layernorm_weight_, rms_norm_eps_);
 
     mx::array mlp_out(0.0f);
     if (use_moe_) {
