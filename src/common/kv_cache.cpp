@@ -1,8 +1,10 @@
 // Copyright © 2024-2025 Apple Inc. — Ported to C++
 
 #include <mlx-lm/common/kv_cache.h>
+#include <mlx-lm/common/gated_delta.h>
 #include <mlx/mlx.h>
 #include <algorithm>
+#include <cstdlib>
 
 namespace mlx_lm {
 
@@ -63,10 +65,21 @@ KVCacheSimple::update_impl(
     int current_alloc = keys_.value().shape(2);
 
     if (offset_ + n_new <= current_alloc) {
-        keys_ = mx::slice_update(keys_.value(), new_keys,
-            mx::Shape{0, 0, offset_, 0}, mx::Shape{B, H, offset_ + n_new, D});
-        values_ = mx::slice_update(values_.value(), new_values,
-            mx::Shape{0, 0, offset_, 0}, mx::Shape{B, H, offset_ + n_new, D});
+        // In-place slice write (output aliases the cache buffer) instead of
+        // slice_update, whose COW donation fails under the async one-behind
+        // pipeline and copies the whole cache — a variable per-token copy count
+        // that makes the decode graph non-replayable. MLX_KV_INPLACE_OFF opts out.
+        static const bool kv_inplace =
+            std::getenv("MLX_KV_INPLACE_OFF") == nullptr;
+        if (kv_inplace) {
+            keys_ = kv_inplace_update(keys_.value(), new_keys, offset_);
+            values_ = kv_inplace_update(values_.value(), new_values, offset_);
+        } else {
+            keys_ = mx::slice_update(keys_.value(), new_keys,
+                mx::Shape{0, 0, offset_, 0}, mx::Shape{B, H, offset_ + n_new, D});
+            values_ = mx::slice_update(values_.value(), new_values,
+                mx::Shape{0, 0, offset_, 0}, mx::Shape{B, H, offset_ + n_new, D});
+        }
         offset_ += n_new;
         return {mx::slice(keys_.value(), mx::Shape{0,0,0,0}, mx::Shape{B,H,offset_,D}),
                 mx::slice(values_.value(), mx::Shape{0,0,0,0}, mx::Shape{B,H,offset_,D})};

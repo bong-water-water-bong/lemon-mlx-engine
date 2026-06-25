@@ -426,11 +426,20 @@ mx::array Qwen35MoEGatedDeltaNet::operator()(
             q_norm_w_ = mx::full({head_k_dim_}, inv_scale * inv_scale, dtype);
             k_norm_w_ = mx::full({head_k_dim_}, inv_scale, dtype);
         }
-        q_out = mx::fast::rms_norm(q_out, *q_norm_w_, 1e-6f);
-        k_out = mx::fast::rms_norm(k_out, *k_norm_w_, 1e-6f);
+        // GDN decode step. MLX_GDN_NO_FUSED=1 -> inline mx::compile recurrence.
+        // MLX_GDN_NO_FUSED2=1 -> the per-op fused path (rms_norm + beta/g +
+        // gated_delta_step). Default: the FlashQLA-style gdn_fused_decode kernel
+        // that folds q/k-RMSNorm + beta/g + recurrence into one launch.
+        static const bool use_fused_gdn = std::getenv("MLX_GDN_NO_FUSED") == nullptr;
+        const bool use_fused2 =
+            use_fused_gdn && std::getenv("MLX_GDN_NO_FUSED2") == nullptr;
 
-        // GDN decode step via the fused HIP kernel (gated_delta_update).
-        // MLX_GDN_NO_FUSED=1 falls back to the inline mx::compile recurrence.
+        // The fused kernel folds the q/k norm; only normalize here otherwise.
+        if (!use_fused2) {
+            q_out = mx::fast::rms_norm(q_out, *q_norm_w_, 1e-6f);
+            k_out = mx::fast::rms_norm(k_out, *k_norm_w_, 1e-6f);
+        }
+
         mx::array ssm_state(0.0f);
         if ((*cache)[1].has_value()) {
             ssm_state = (*cache)[1].value();
@@ -438,11 +447,17 @@ mx::array Qwen35MoEGatedDeltaNet::operator()(
             ssm_state = mx::zeros({B, num_v_heads_, head_v_dim_, head_k_dim_}, dtype);
         }
 
-        static const bool use_fused_gdn = std::getenv("MLX_GDN_NO_FUSED") == nullptr;
         if (use_fused_gdn) {
-            auto [o, ns] = gated_delta_update(
-                q_out, k_out, v_out, a_val, b_val, a_log_, dt_bias_, ssm_state,
-                std::nullopt, /*inplace=*/false);
+            mx::array o(0.0f), ns(0.0f);
+            if (use_fused2) {
+                std::tie(o, ns) = gdn_fused_decode(
+                    q_out, k_out, v_out, a_val, b_val, a_log_, dt_bias_,
+                    *q_norm_w_, *k_norm_w_, ssm_state);
+            } else {
+                std::tie(o, ns) = gated_delta_update(
+                    q_out, k_out, v_out, a_val, b_val, a_log_, dt_bias_,
+                    ssm_state, std::nullopt, /*inplace=*/false);
+            }
             (*cache)[1] = ns;
             auto normalized = norm_(o, z);
             return linear_fwd(mx::reshape(normalized, {B, S, -1}), out_proj_weight_);
