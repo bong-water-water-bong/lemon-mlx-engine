@@ -382,6 +382,16 @@ void Qwen35MoEGatedDeltaNet::ensure_in_proj_fused() {
                            in_proj_fused_weight_);
 }
 
+// In-place overwrite of dst with src via native slice_update donation (start=0).
+static mlx::core::array gdn_state_overwrite_(mlx::core::array dst,
+                                             const mlx::core::array& src) {
+    int nd = dst.ndim();
+    std::vector<int> axes(nd);
+    for (int i = 0; i < nd; ++i) axes[i] = i;
+    return mx::slice_update(std::move(dst), src,
+                            mx::zeros({nd}, mx::int32), axes);
+}
+
 mx::array Qwen35MoEGatedDeltaNet::operator()(
     const mx::array& inputs,
     const std::optional<mx::array>& mask,
@@ -415,43 +425,16 @@ mx::array Qwen35MoEGatedDeltaNet::operator()(
     // Conv1d processing.
     auto dtype = inputs.dtype();
 
-    // Device-position double-buffered recurrent state for build-once HIP-graph
-    // decode. The built graph is relaunched many times; an in-place RMW at a
-    // fixed address does NOT accumulate across replays — only device-position-
-    // indexed writes do (same as the KV cache). So in graph mode we keep conv +
-    // SSM state as a [2, …] ping-pong buffer: read slot pos&1, write (pos+1)&1
-    // via dynamic slice/slice_update. Each replay's device pos advances, so it
-    // reads the previous replay's write and accumulates.
-    static const bool no_dbuf = std::getenv("MLX_GDN_NO_DBUF") != nullptr;
-    bool gdn_dbuf = !no_dbuf && mlx_lm::graph_external_pos() && S == 1 && cache;
-    mx::array ridx(0), widx(0);
-    if (gdn_dbuf) {
-        auto pos2 = mlx_lm::graph_decode_pos();
-        ridx = mx::remainder(pos2, mx::array(2, mx::int32));
-        widx = mx::remainder(mx::add(pos2, mx::array(1, mx::int32)),
-                             mx::array(2, mx::int32));
-        // Promote prefill's single-buffer state to a [2, …] double buffer, both
-        // slots seeded with the current state so the first read is parity-safe.
-        for (int i = 0; i < 2; ++i) {
-            if ((*cache)[i].has_value() && (*cache)[i].value().shape(0) != 2) {
-                auto s = mx::expand_dims((*cache)[i].value(), 0);
-                (*cache)[i] = mx::contiguous(mx::concatenate({s, s}, 0));
-            }
-        }
-        // Outside graph capture, snapshot the parity now: the lazy index aliases
-        // the shared decode-pos buffer, and the async pipeline would otherwise
-        // evaluate it after the loop advances pos, reading the wrong slot.
-        if (!mlx_lm::graph_capturing()) {
-            mx::eval(ridx, widx);
-        }
-    }
+    // Build-once HIP-graph decode: keep the conv + SSM recurrent state in a SINGLE
+    // static buffer updated IN PLACE (inplace_write). The recorded graph reads the
+    // fixed-address state, computes the new state, and writes it back into the same
+    // buffer — one kernel's read-before-write is safe within a launch, and the
+    // in-place write accumulates across relaunches. No double buffer / parity is
+    // needed (only stream capture required ping-pong; build+relaunch does not).
+    bool gdn_inplace = mlx_lm::graph_external_pos() && S == 1 && cache;
 
     mx::array conv_state(0.0f);
-    if (gdn_dbuf && (*cache)[0].has_value()) {
-        conv_state = mx::squeeze(
-            mx::slice((*cache)[0].value(), ridx, {0},
-                      {1, B, conv_kernel_size_ - 1, conv_dim_}), 0);
-    } else if (cache && (*cache)[0].has_value()) {
+    if (cache && (*cache)[0].has_value()) {
         conv_state = (*cache)[0].value();
     } else {
         conv_state = mx::zeros({B, conv_kernel_size_ - 1, conv_dim_}, dtype);
@@ -467,11 +450,11 @@ mx::array Qwen35MoEGatedDeltaNet::operator()(
     if (S == 1 && cache) {
         auto [conv_out, new_state] =
             gdn_conv_step(conv_state, qkv, conv1d_weight_);
-        if (gdn_dbuf && (*cache)[0].has_value()) {
-            // std::move releases the cache ref so slice_update donates (in-place
-            // write into the persistent [2,…] buffer at a fixed address).
-            auto s = std::move((*cache)[0].value());
-            (*cache)[0] = mx::slice_update(s, mx::expand_dims(new_state, 0), widx, {0});
+        if (gdn_inplace && (*cache)[0].has_value()) {
+            // Read [0], write new state to scratch [2]; loop copies [2]->[0].
+            if (!(*cache)[2].has_value())
+                (*cache)[2] = mx::zeros_like((*cache)[0].value());
+            (*cache)[2] = gdn_state_overwrite_(std::move((*cache)[2].value()), new_state);
         } else {
             (*cache)[0] = new_state;
         }
@@ -505,14 +488,17 @@ mx::array Qwen35MoEGatedDeltaNet::operator()(
         }
 
         mx::array ssm_state(0.0f);
-        if (gdn_dbuf && (*cache)[1].has_value()) {
-            ssm_state = mx::squeeze(
-                mx::slice((*cache)[1].value(), ridx, {0},
-                          {1, B, num_v_heads_, head_v_dim_, head_k_dim_}), 0);
-        } else if ((*cache)[1].has_value()) {
+        if ((*cache)[1].has_value()) {
             ssm_state = (*cache)[1].value();
         } else {
             ssm_state = mx::zeros({B, num_v_heads_, head_v_dim_, head_k_dim_}, dtype);
+        }
+
+        static const bool st_ck = std::getenv("MLX_STATE_CKSUM") != nullptr;
+        if (st_ck) {
+            auto c = mx::sum(mx::abs(mx::astype(ssm_state, mx::float32)));
+            mx::eval(c);
+            fprintf(stderr, "[st] read_ssm %.6e\n", c.item<float>());
         }
 
         if (use_fused_gdn) {
@@ -526,9 +512,11 @@ mx::array Qwen35MoEGatedDeltaNet::operator()(
                     q_out, k_out, v_out, a_val, b_val, a_log_, dt_bias_,
                     ssm_state, std::nullopt, /*inplace=*/false);
             }
-            if (gdn_dbuf && (*cache)[1].has_value()) {
-                auto s = std::move((*cache)[1].value());
-                (*cache)[1] = mx::slice_update(s, mx::expand_dims(ns, 0), widx, {0});
+            if (gdn_inplace && (*cache)[1].has_value()) {
+                // Read [1], write new state to scratch [3]; loop copies [3]->[1].
+                if (!(*cache)[3].has_value())
+                    (*cache)[3] = mx::zeros_like((*cache)[1].value());
+                (*cache)[3] = gdn_state_overwrite_(std::move((*cache)[3].value()), ns);
             } else {
                 (*cache)[1] = ns;
             }
@@ -874,10 +862,17 @@ mx::array Qwen35MoEModelInner::operator()(const mx::array& inputs, std::vector<K
     // SSM mask: always nullopt (no left padding support)
     std::optional<mx::array> ssm_mask;
 
+    static const bool cksum = std::getenv("MLX_PURE_CKSUM") != nullptr;
     for (size_t i = 0; i < layers_.size(); ++i) {
         KVCache* lc = (cache && i < cache->size()) ? &(*cache)[i] : nullptr;
         auto attn_mask = layers_[i].is_linear() ? AttentionMask{} : fa_mask;
         h = layers_[i](h, attn_mask, ssm_mask, lc);
+        if (cksum) {
+            auto c = mx::sum(mx::abs(mx::astype(h, mx::float32)));
+            mx::eval(c);
+            fprintf(stderr, "[ck] L%02zu %s %.7e\n", i,
+                    layers_[i].is_linear() ? "gdn " : "attn", c.item<float>());
+        }
     }
 
     return mx::fast::rms_norm(h, norm_weight_, rms_norm_eps_);
@@ -955,10 +950,17 @@ mx::array Qwen35MoEModelInner::forward_prenorm(const mx::array& inputs, std::vec
 
     std::optional<mx::array> ssm_mask;
 
+    static const bool cksum = std::getenv("MLX_PURE_CKSUM") != nullptr;
     for (size_t i = 0; i < layers_.size(); ++i) {
         KVCache* lc = (cache && i < cache->size()) ? &(*cache)[i] : nullptr;
         auto attn_mask = layers_[i].is_linear() ? AttentionMask{} : fa_mask;
         h = layers_[i](h, attn_mask, ssm_mask, lc);
+        if (cksum) {
+            auto c = mx::sum(mx::abs(mx::astype(h, mx::float32)));
+            mx::eval(c);
+            fprintf(stderr, "[ck] L%02zu %s %.7e\n", i,
+                    layers_[i].is_linear() ? "gdn " : "attn", c.item<float>());
+        }
     }
 
     return h;  // pre-norm

@@ -329,10 +329,11 @@ private:
     int token_count_ = 0;
 
     // --- Pure-relaunch graph decode (build-once, deterministic arena) ---
-    // 0 = not engaged; 1 = graph recorded, replaying. Engaged on the first
-    // steady single-token decode step when MLX_DECODE_GRAPH_PURE is set.
+    // State machine: 0 warmup, 1 record parity A, 2 record parity B, 3 replay,
+    // 9 disabled. Two graphs (one per pos&1) bake the GDN ping-pong state slots.
     int pure_graph_state_ = 0;
     int pure_graph_cap_ = 0;      // reserved KV capacity
+    int pure_pos_ = 0;            // host mirror of the device decode position
     // Run one decode step under the pure-graph path; returns the sampled token.
     mlx::core::array step_pure_graph(const LMInput::Text& previous);
 

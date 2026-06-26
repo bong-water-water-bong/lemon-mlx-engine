@@ -176,7 +176,11 @@ public:
 // Mamba-style state space model cache.
 // Stores conv_state (index 0) and ssm_state (index 1).
 class MambaCache {
-    std::optional<mlx::core::array> states_[2];
+    // [0]=conv_state, [1]=ssm_state. [2]/[3] are scratch "next-state" buffers for
+    // build-once graph decode: the recorded graph reads [0]/[1] and writes the new
+    // state to [2]/[3] (different buffers → no read==write hazard on relaunch);
+    // the decode loop copies [2]->[0], [3]->[1] between relaunches.
+    std::optional<mlx::core::array> states_[4];
     int offset_ = 0;
 
 public:
