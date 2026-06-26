@@ -978,8 +978,10 @@ mx::array kv_inplace_update(
         std::nullopt, true, {});
     return res[0];
 #else
-    return mx::slice_update(cache, new_kv, {0, 0, offset, 0},
-        {cache.shape(0), cache.shape(1), offset + new_kv.shape(2), cache.shape(3)});
+    mx::Shape st{0, 0, offset, 0};
+    mx::Shape sp{cache.shape(0), cache.shape(1), offset + new_kv.shape(2),
+                 cache.shape(3)};
+    return mx::slice_update(cache, new_kv, st, sp, mx::Shape{1, 1, 1, 1});
 #endif
 }
 
