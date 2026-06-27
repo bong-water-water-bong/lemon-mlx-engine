@@ -16,8 +16,10 @@
 #include <mlx-lm/common/quantized_linear.h>
 #include <mlx-lm/common/graph_decode.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <iostream>
+#include <optional>
 
 namespace mx = mlx::core;
 
@@ -388,8 +390,19 @@ static mlx::core::array gdn_state_overwrite_(mlx::core::array dst,
     int nd = dst.ndim();
     std::vector<int> axes(nd);
     for (int i = 0; i < nd; ++i) axes[i] = i;
-    return mx::slice_update(std::move(dst), src,
-                            mx::zeros({nd}, mx::int32), axes);
+    // The all-zeros start index never changes; rebuilding it each call lowered to
+    // a redundant memset node per GDN layer per token (~80/token under graph
+    // capture). Cache one constant per ndim so it is built once and reused — the
+    // captured graph then references a fixed buffer instead of recording a memset.
+    static std::array<std::optional<mlx::core::array>, 8> z_cache;
+    if (nd < 8) {
+        if (!z_cache[nd].has_value()) {
+            z_cache[nd] = mx::zeros({nd}, mx::int32);
+            mx::eval(z_cache[nd].value());
+        }
+        return mx::slice_update(std::move(dst), src, z_cache[nd].value(), axes);
+    }
+    return mx::slice_update(std::move(dst), src, mx::zeros({nd}, mx::int32), axes);
 }
 
 mx::array Qwen35MoEGatedDeltaNet::operator()(
